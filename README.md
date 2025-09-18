@@ -2,6 +2,7 @@
 
 Offical Repo of FP64 is All You Need: Rethinking Failure Modes in Physics-Informed Neural Networks
 
+[News] Our paper is accepted by NeurIPS.
 
 ## Get Started
 
