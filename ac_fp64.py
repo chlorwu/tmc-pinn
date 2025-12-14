@@ -93,7 +93,7 @@ for iter in tqdm(range(1)):
     print(get_n_params(model))
     loss_track = []
 
-    for i in tqdm(range(10000)):
+    for i in tqdm(range(2500)): # epoch changed from 10000 to 2500
 
         def closure():
             pred_res = model(x_res, t_res)

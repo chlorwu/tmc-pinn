@@ -86,7 +86,14 @@ gradient_stats = []
 
 print(model.named_parameters())
 
-for i in tqdm(range(50000)):
+# Set up loss log file
+if not os.path.exists('./results/'):
+    os.makedirs('./results/')
+loss_log_file = f'./results/1dconvection_{args.model}_{num_step}_{step_size}_{beta}_loss_log.txt'
+with open(loss_log_file, 'w') as f:
+    f.write('epoch,loss_res,loss_bc,loss_ic,total_loss\n')
+
+for i in tqdm(range(12500)): # epoch changed from 50000 to 12500
     def closure():
         pred_res = model(x_res, t_res)
         pred_left = model(x_left, t_left)
@@ -119,6 +126,13 @@ for i in tqdm(range(50000)):
 
 
     optim.step(closure)
+
+    # Log loss to file
+    if len(loss_track) > 0:
+        loss_res_val, loss_bc_val, loss_ic_val = loss_track[-1]
+        total_loss_val = loss_res_val + loss_bc_val + loss_ic_val
+        with open(loss_log_file, 'a') as f:
+            f.write(f'{i},{loss_res_val:.10e},{loss_bc_val:.10e},{loss_ic_val:.10e},{total_loss_val:.10e}\n')
 
     grad_norms = []
     grad_means = []
@@ -275,3 +289,46 @@ plt.legend()
 plt.grid()
 plt.savefig(f'./results/1d_convection_{args.model}_{beta}_fp64_gradient_stds.pdf')  
 plt.close()  
+
+# Read loss log file and create loss vs epoch plot
+try:
+    loss_data = np.loadtxt(loss_log_file, delimiter=',', skiprows=1)
+    epochs = loss_data[:, 0]
+    loss_res = loss_data[:, 1]
+    loss_bc = loss_data[:, 2]
+    loss_ic = loss_data[:, 3]
+    total_loss = loss_data[:, 4]
+    
+    plt.figure(figsize=(12, 8))
+    
+    # Plot individual loss components
+    plt.subplot(2, 1, 1)
+    plt.plot(epochs, loss_res, label='Loss Res', alpha=0.7)
+    plt.plot(epochs, loss_bc, label='Loss BC', alpha=0.7)
+    plt.plot(epochs, loss_ic, label='Loss IC', alpha=0.7)
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.title('Individual Loss Components')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.yscale('log')  # Use log scale for better visualization
+    
+    # Plot total loss
+    plt.subplot(2, 1, 2)
+    plt.plot(epochs, total_loss, label='Total Loss', color='red', linewidth=2)
+    plt.xlabel('Epoch')
+    plt.ylabel('Total Loss')
+    plt.title('Total Loss vs Epoch')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.yscale('log')  # Use log scale for better visualization
+    
+    plt.tight_layout()
+    plt.savefig(f'./results/1d_convection_{args.model}_{beta}_fp64_loss_vs_epoch.pdf', bbox_inches='tight')
+    plt.close()
+    
+    print(f'\nLoss log file saved at: {loss_log_file}')
+    print(f'Loss plot saved at: ./results/1d_convection_{args.model}_{beta}_fp64_loss_vs_epoch.pdf')
+    
+except Exception as e:
+    print(f'Warning: Could not read loss log file or create plot: {e}')
