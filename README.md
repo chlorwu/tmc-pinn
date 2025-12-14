@@ -1,8 +1,7 @@
 # PINN_FP64
 
-Offical Repo of FP64 is All You Need: Rethinking Failure Modes in Physics-Informed Neural Networks
-
-[News] Our paper is accepted by NeurIPS.
+Cloned Repo from FP64 is All You Need: Rethinking Failure Modes in Physics-Informed Neural Networks
+Cloned by intent of educational / research purposes for team TMC
 
 ## Get Started
 
