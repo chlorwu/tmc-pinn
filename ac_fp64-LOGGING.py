@@ -31,7 +31,7 @@ for iter in tqdm(range(1)):
     torch.cuda.manual_seed(seed)
 
     parser = argparse.ArgumentParser('Training Point Optimization')
-    parser.add_argument('--model', type=str, default='pinn')
+    parser.add_argument('--model', type=str, default='PINN')
     parser.add_argument('--device', type=str, default='cuda:0')
     parser.add_argument('--layers', type=int, default=3)
     args = parser.parse_args()

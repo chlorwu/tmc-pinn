@@ -22,7 +22,7 @@ num_step=5
 beta=50
 
 parser = argparse.ArgumentParser('Training Point Optimization')
-parser.add_argument('--model', type=str, default='pinn')
+parser.add_argument('--model', type=str, default='PINN')
 parser.add_argument('--device', type=str, default='cuda:0')
 args = parser.parse_args()
 device = args.device
