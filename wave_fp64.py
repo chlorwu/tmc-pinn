@@ -75,7 +75,16 @@ print(get_n_params(model))
 loss_track = []
 pi = torch.tensor(np.pi, dtype=torch.float64, requires_grad=False).to(device)
 
-for i in tqdm(range(10000)):
+# Create results directory if it doesn't exist
+if not os.path.exists('./results/wave/'):
+    os.makedirs('./results/wave/')
+
+# Open log file for writing losses
+log_file_path = f'./results/wave/1dwave_{args.model}_loss_log.txt'
+with open(log_file_path, 'w') as log_file:
+    log_file.write('epoch,loss_res,loss_ic,loss_bc,total_loss\n')
+
+for i in tqdm(range(2500)): # epoch changed from 10000 to 2500
     def closure():
         pred_res = model(x_res, t_res)
         pred_left = model(x_left, t_left)
@@ -115,6 +124,16 @@ for i in tqdm(range(10000)):
 
 
     optim.step(closure)
+    
+    # Log losses to file after each epoch
+    if len(loss_track) > 0:
+        loss_res_val = loss_track[-1][0]
+        loss_ic_val = loss_track[-1][1]
+        loss_bc_val = loss_track[-1][2]
+        total_loss_val = loss_res_val + loss_ic_val + loss_bc_val
+        
+        with open(log_file_path, 'a') as log_file:
+            log_file.write(f'{i+1},{loss_res_val:.8e},{loss_ic_val:.8e},{loss_bc_val:.8e},{total_loss_val:.8e}\n')
 
 print('Loss Res: {:4f}, Loss_BC: {:4f}, Loss_IC: {:4f}'.format(loss_track[-1][0], loss_track[-1][1], loss_track[-1][2]))
 print('Train Loss: {:4f}'.format(np.sum(loss_track[-1])))
@@ -180,4 +199,34 @@ plt.colorbar()
 plt.tight_layout()
 #plt.axis('off')
 plt.savefig(f'./results/wave/1dwave_{args.model}_{num_step}_{step_size}_error.pdf', bbox_inches='tight')
+
+# Plot loss curves from log file
+try:
+    # Load the loss data
+    loss_data = np.loadtxt(log_file_path, delimiter=',', skiprows=1)
+    epochs = loss_data[:, 0]
+    loss_res = loss_data[:, 1]
+    loss_ic = loss_data[:, 2]
+    loss_bc = loss_data[:, 3]
+    total_loss = loss_data[:, 4]
+    
+    # Create loss vs epoch plot
+    plt.figure(figsize=(10, 6))
+    plt.semilogy(epochs, total_loss, 'b-', label='Total Loss', linewidth=2)
+    plt.semilogy(epochs, loss_res, 'r--', label='Residual Loss', linewidth=1.5, alpha=0.7)
+    plt.semilogy(epochs, loss_ic, 'm--', label='Initial Condition Loss', linewidth=1.5, alpha=0.7)
+    plt.semilogy(epochs, loss_bc, 'g--', label='Boundary Condition Loss', linewidth=1.5, alpha=0.7)
+    plt.xlabel('Epoch', fontsize=12)
+    plt.ylabel('Loss (log scale)', fontsize=12)
+    plt.title(f'Loss vs Epoch - {args.model}', fontsize=14)
+    plt.legend(fontsize=10)
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(f'./results/wave/1dwave_{args.model}_loss_curve.pdf', bbox_inches='tight')
+    plt.close()
+    
+    print(f'\nLoss log file saved at: {os.path.abspath(log_file_path)}')
+    print(f'Loss curve plot saved at: ./results/wave/1dwave_{args.model}_loss_curve.pdf')
+except Exception as e:
+    print(f'\nWarning: Could not read loss log file or create plot: {e}')
 
