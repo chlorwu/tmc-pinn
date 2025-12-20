@@ -93,6 +93,13 @@ for iter in tqdm(range(1)):
     print(get_n_params(model))
     loss_track = []
 
+    # Set up loss log file
+    if not os.path.exists('./results/'):
+        os.makedirs('./results/')
+    loss_log_file = f'./results/1dac_{args.model}_loss_log.txt'
+    with open(loss_log_file, 'w') as f:
+        f.write('epoch,loss_res,loss_bc_1,loss_bc_2,loss_ic,total_loss\n')
+
     for i in tqdm(range(2500)): # epoch changed from 10000 to 2500
 
         def closure():
@@ -135,6 +142,13 @@ for iter in tqdm(range(1)):
         #if i%100 ==0 :
          #   print('Loss Res: {:4f}, Loss_BC1: {:4f}, Loss_BC2: {:4f}, Loss_IC: {:4f}'.format(loss_track[-1][0], loss_track[-1][1], loss_track[-1][2], loss_track[-1][3]))
 
+        # Log loss to file
+        if len(loss_track) > 0:
+            loss_res_val, loss_bc_1_val, loss_bc_2_val, loss_ic_val = loss_track[-1]
+            total_loss_val = 10 * loss_res_val + loss_bc_1_val + loss_bc_2_val + 100 * loss_ic_val
+            with open(loss_log_file, 'a') as f:
+                f.write(f'{i},{loss_res_val:.10e},{loss_bc_1_val:.10e},{loss_bc_2_val:.10e},{loss_ic_val:.10e},{total_loss_val:.10e}\n')
+
 
 
     print('Loss Res: {:4f}, Loss_BC1: {:4f}, Loss_BC2: {:4f}, Loss_IC: {:4f}'.format(loss_track[-1][0], loss_track[-1][1], loss_track[-1][2], loss_track[-1][3]))
@@ -174,6 +188,51 @@ for iter in tqdm(range(1)):
     l1_list.append(rl1)
     l2_list.append(rl2)
     loss_list.append(np.sum(loss_track[-1]))
+
+    # Read loss log file and create loss vs epoch plot
+    try:
+        loss_data = np.loadtxt(loss_log_file, delimiter=',', skiprows=1)
+        epochs = loss_data[:, 0]
+        loss_res = loss_data[:, 1]
+        loss_bc_1 = loss_data[:, 2]
+        loss_bc_2 = loss_data[:, 3]
+        loss_ic = loss_data[:, 4]
+        total_loss = loss_data[:, 5]
+        
+        plt.figure(figsize=(12, 8))
+        
+        # Plot individual loss components
+        plt.subplot(2, 1, 1)
+        plt.plot(epochs, loss_res, label='Loss Res', alpha=0.7)
+        plt.plot(epochs, loss_bc_1, label='Loss BC1', alpha=0.7)
+        plt.plot(epochs, loss_bc_2, label='Loss BC2', alpha=0.7)
+        plt.plot(epochs, loss_ic, label='Loss IC', alpha=0.7)
+        plt.xlabel('Epoch')
+        plt.ylabel('Loss')
+        plt.title('Individual Loss Components')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        plt.yscale('log')  # Use log scale for better visualization
+        
+        # Plot total loss
+        plt.subplot(2, 1, 2)
+        plt.plot(epochs, total_loss, label='Total Loss', color='red', linewidth=2)
+        plt.xlabel('Epoch')
+        plt.ylabel('Total Loss')
+        plt.title('Total Loss vs Epoch')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        plt.yscale('log')  # Use log scale for better visualization
+        
+        plt.tight_layout()
+        plt.savefig(f'./results/1dac_{args.model}_loss_vs_epoch.pdf', bbox_inches='tight')
+        plt.close()
+        
+        print(f'\nLoss log file saved at: {loss_log_file}')
+        print(f'Loss plot saved at: ./results/1dac_{args.model}_loss_vs_epoch.pdf')
+        
+    except Exception as e:
+        print(f'Warning: Could not read loss log file or create plot: {e}')
 
     seed = seed + 10
 
