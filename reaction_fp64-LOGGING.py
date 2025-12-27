@@ -81,7 +81,7 @@ log_file_path = f'./results/1dreaction_{args.model}_loss_log.txt'
 with open(log_file_path, 'w') as log_file:
     log_file.write('epoch,loss_res,loss_bc,loss_ic,total_loss\n')
 
-for i in tqdm(range(500)): # epoch changed from 2000 to 500
+for i in tqdm(range(2000)): # epoch changed from 2000 to 500
     def closure():
         pred_res = model(x_res, t_res)
         pred_left = model(x_left, t_left)
