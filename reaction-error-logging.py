@@ -1,4 +1,4 @@
-# THIS WORKS
+# reaction_fp64-LOGGING.py with precision switching
 import time
 import os
 import torch
@@ -11,13 +11,16 @@ import argparse
 from util import *
 from model_dict import get_model
 
+# <-- Added import for switching -->
+from precision_switcher import ConvergencePrecisionSwitcher
+
 seed = 1
 np.random.seed(seed)
 random.seed(seed)
 torch.manual_seed(seed)
 torch.cuda.manual_seed(seed)
 step_size = 1e-4
-num_step=5
+num_step = 5
 
 parser = argparse.ArgumentParser('Training Point Optimization')
 parser.add_argument('--model', type=str, default='PINN')
@@ -50,12 +53,12 @@ x_lower, t_lower = b_lower[:, ..., 0:1], b_lower[:, ..., 1:2]
 
 def init_weights(m):
     if isinstance(m, nn.Linear):
-        torch.nn.init.xavier_uniform(m.weight)
-        m.bias.data.fill_(0.00)
+        torch.nn.init.xavier_uniform_(m.weight)  # updated to torch recommended
+        m.bias.data.fill_(0.0)
 
 
 if args.model == 'KAN':
-    model = get_model(args).Model(width=[2, 5, 1], grid=5, k=3, grid_eps=1.0, \
+    model = get_model(args).Model(width=[2, 5, 1], grid=5, k=3, grid_eps=1.0,
                                   noise_scale_base=0.25, device=device).to(torch.float64).to(device)
 elif args.model == 'QRes':
     model = get_model(args).Model(in_dim=2, hidden_dim=256, out_dim=1, num_layer=4).to(torch.float64).to(device)
@@ -67,7 +70,10 @@ else:
     model = get_model(args).Model(in_dim=2, hidden_dim=1024, out_dim=1, num_layer=6).to(torch.float64).to(device)
     model.apply(init_weights)
 
-optim = LBFGS(model.parameters(), line_search_fn='strong_wolfe', tolerance_grad = 1e-8, tolerance_change= 1e-10)
+optim = LBFGS(model.parameters(), line_search_fn='strong_wolfe', tolerance_grad=1e-8, tolerance_change=1e-10)
+
+# <-- Initialize the precision switcher -->
+switcher = ConvergencePrecisionSwitcher(model, optim)
 
 print(model)
 print(get_n_params(model))
@@ -80,9 +86,9 @@ if not os.path.exists('./results/'):
 # Open log file for writing losses
 log_file_path = f'./results/1dreaction_{args.model}_loss_log.txt'
 with open(log_file_path, 'w') as log_file:
-    log_file.write('epoch,loss_res,loss_bc,loss_ic,total_loss\n')
+    log_file.write('epoch,loss_res,loss_bc,loss_ic,total_loss,precision\n')
 
-for i in tqdm(range(500)): # epoch changed from 2000 to 500
+for i in tqdm(range(2000)):  # original 2000 epochs
     def closure():
         pred_res = model(x_res, t_res)
         pred_left = model(x_left, t_left)
@@ -107,25 +113,28 @@ for i in tqdm(range(500)): # epoch changed from 2000 to 500
         loss.backward()
         return loss
 
-
     optim.step(closure)
-    
-    # Log losses to file after each epoch
-    if len(loss_track) > 0:
-        loss_res_val = loss_track[-1][0]
-        loss_bc_val = loss_track[-1][1]
-        loss_ic_val = loss_track[-1][2]
-        total_loss_val = loss_res_val + loss_bc_val + loss_ic_val
-        
-        with open(log_file_path, 'a') as log_file:
-            log_file.write(f'{i+1},{loss_res_val:.8e},{loss_bc_val:.8e},{loss_ic_val:.8e},{total_loss_val:.8e}\n')
+
+    # Step precision switcher and get current precision
+    current_precision = switcher.step(loss_track[-1][0] + loss_track[-1][1] + loss_track[-1][2])
+
+    # Log losses and precision
+    loss_res_val = loss_track[-1][0]
+    loss_bc_val = loss_track[-1][1]
+    loss_ic_val = loss_track[-1][2]
+    total_loss_val = loss_res_val + loss_bc_val + loss_ic_val
+
+    with open(log_file_path, 'a') as log_file:
+        log_file.write(f'{i+1},{loss_res_val:.8e},{loss_bc_val:.8e},{loss_ic_val:.8e},{total_loss_val:.8e},{current_precision}\n')
+
+    tqdm.write(f"Epoch {i+1}: Loss Res={loss_res_val:.3e}, BC={loss_bc_val:.3e}, IC={loss_ic_val:.3e}, Total={total_loss_val:.3e}, Precision={current_precision}")
 
 print('Loss Res: {:4f}, Loss_BC: {:4f}, Loss_IC: {:4f}'.format(loss_track[-1][0], loss_track[-1][1], loss_track[-1][2]))
 print('Train Loss: {:4f}'.format(np.sum(loss_track[-1])))
 
 torch.save(model.state_dict(), f'./results/1dreaction_{args.model}_point.pt')
 
-# Visualize
+# --- Visualization section stays unchanged ---
 if args.model == 'PINNsFormer' or args.model == 'PINNMamba':
     res_test = make_time_sequence(res_test, num_step=5, step=1e-4)
 
@@ -138,14 +147,11 @@ with torch.no_grad():
 
 pred = pred.reshape(101, 101)
 
-
 def h(x):
     return np.exp(- (x - np.pi) ** 2 / (2 * (np.pi / 4) ** 2))
 
-
 def u_ana(x, t):
     return h(x) * np.exp(5 * t) / (h(x) * np.exp(5 * t) + 1 - h(x))
-
 
 res_test, _, _, _, _ = get_data([0, 2 * np.pi], [0, 1], 101, 101)
 u = u_ana(res_test[:, 0], res_test[:, 1]).reshape(101, 101)
@@ -163,7 +169,6 @@ plt.ylabel('t')
 plt.title('Predicted u(x,t)')
 plt.colorbar()
 plt.tight_layout()
-#plt.axis('off')
 plt.savefig(f'./results/1d_reaction_{args.model}_{num_step}_{step_size}_pred.pdf', bbox_inches='tight')
 
 plt.figure(figsize=(4, 3))
@@ -173,7 +178,6 @@ plt.ylabel('t')
 plt.title('Exact u(x,t)')
 plt.colorbar()
 plt.tight_layout()
-#plt.axis('off')
 plt.savefig('./results/1d_reaction_exact.pdf', bbox_inches='tight')
 
 plt.figure(figsize=(4, 3))
@@ -183,20 +187,17 @@ plt.ylabel('t')
 plt.title('Absolute Error')
 plt.colorbar()
 plt.tight_layout()
-#plt.axis('off')
 plt.savefig(f'./results/1d_reaction_{args.model}_{num_step}_{step_size}_error.pdf', bbox_inches='tight')
 
 # Plot loss curves from log file
 try:
-    # Load the loss data
     loss_data = np.loadtxt(log_file_path, delimiter=',', skiprows=1)
     epochs = loss_data[:, 0]
     loss_res = loss_data[:, 1]
     loss_bc = loss_data[:, 2]
     loss_ic = loss_data[:, 3]
     total_loss = loss_data[:, 4]
-    
-    # Create loss vs epoch plot
+
     plt.figure(figsize=(10, 6))
     plt.semilogy(epochs, total_loss, 'b-', label='Total Loss', linewidth=2)
     plt.semilogy(epochs, loss_res, 'r--', label='Residual Loss', linewidth=1.5, alpha=0.7)
