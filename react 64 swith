@@ -1,0 +1,168 @@
+import time
+import os
+import torch
+import torch.nn as nn
+import matplotlib.pyplot as plt
+import random
+from torch.optim import LBFGS
+from tqdm import tqdm
+import argparse
+from util import *
+from model_dict import get_model
+import numpy as np
+
+# ===================== SEED =====================
+seed = 1
+np.random.seed(seed)
+random.seed(seed)
+torch.manual_seed(seed)
+torch.cuda.manual_seed(seed)
+
+# ===================== CONFIG =====================
+step_size = 1e-4
+num_step = 5
+SWITCH_EPOCH = 20   # <-- precision switch happens here (safe point)
+
+parser = argparse.ArgumentParser('Training Point Optimization')
+parser.add_argument('--model', type=str, default='PINN')
+parser.add_argument('--device', type=str, default='cuda:0')
+args = parser.parse_args()
+device = args.device
+
+# ===================== DATA =====================
+res, b_left, b_right, b_upper, b_lower = get_data([0, 2 * np.pi], [0, 1], 101, 101)
+res_test, _, _, _, _ = get_data([0, 2 * np.pi], [0, 1], 101, 101)
+
+if args.model in ['PINNsFormer', 'PINNMamba']:
+    res = make_time_sequence(res, num_step=10, step=step_size)
+    b_left = make_time_sequence(b_left, num_step=num_step, step=step_size)
+    b_right = make_time_sequence(b_right, num_step=num_step, step=step_size)
+    b_upper = make_time_sequence(b_upper, num_step=num_step, step=step_size)
+    b_lower = make_time_sequence(b_lower, num_step=num_step, step=step_size)
+
+# START IN FP64
+DTYPE = torch.float64
+
+res = torch.tensor(res, dtype=DTYPE, requires_grad=True).to(device)
+b_left = torch.tensor(b_left, dtype=DTYPE, requires_grad=True).to(device)
+b_right = torch.tensor(b_right, dtype=DTYPE, requires_grad=True).to(device)
+b_upper = torch.tensor(b_upper, dtype=DTYPE, requires_grad=True).to(device)
+b_lower = torch.tensor(b_lower, dtype=DTYPE, requires_grad=True).to(device)
+
+x_res, t_res = res[..., 0:1], res[..., 1:2]
+x_left, t_left = b_left[..., 0:1], b_left[..., 1:2]
+x_right, t_right = b_right[..., 0:1], b_right[..., 1:2]
+x_upper, t_upper = b_upper[..., 0:1], b_upper[..., 1:2]
+x_lower, t_lower = b_lower[..., 0:1], b_lower[..., 1:2]
+
+# ===================== MODEL =====================
+def init_weights(m):
+    if isinstance(m, nn.Linear):
+        nn.init.xavier_uniform_(m.weight)
+        m.bias.data.fill_(0.0)
+
+model = get_model(args).Model(
+    in_dim=2, hidden_dim=1024, out_dim=1, num_layer=6
+).to(DTYPE).to(device)
+model.apply(init_weights)
+
+# ===================== OPTIMIZER =====================
+optim = LBFGS(
+    model.parameters(),
+    line_search_fn='strong_wolfe',
+    tolerance_grad=1e-8,
+    tolerance_change=1e-10
+)
+
+# ===================== LOGGING =====================
+os.makedirs('./results/', exist_ok=True)
+
+loss_log = f'./results/1dreaction_{args.model}_loss_log.txt'
+precision_log = f'./results/precision_switch_log.txt'
+
+with open(loss_log, 'w') as f:
+    f.write('epoch,loss_res,loss_bc,loss_ic,total_loss\n')
+
+with open(precision_log, 'w') as f:
+    f.write('epoch,old_dtype,new_dtype,timestamp\n')
+
+# ===================== TRAIN =====================
+loss_track = []
+precision_switched = False
+
+for epoch in tqdm(range(2000), desc="Training"):
+    def closure():
+        optim.zero_grad()
+
+        pred_res = model(x_res, t_res)
+        pred_left = model(x_left, t_left)
+        pred_right = model(x_right, t_right)
+        pred_upper = model(x_upper, t_upper)
+        pred_lower = model(x_lower, t_lower)
+
+        u_x = torch.autograd.grad(
+            pred_res, x_res, torch.ones_like(pred_res),
+            retain_graph=True, create_graph=True
+        )[0]
+
+        u_t = torch.autograd.grad(
+            pred_res, t_res, torch.ones_like(pred_res),
+            retain_graph=True, create_graph=True
+        )[0]
+
+        loss_res = torch.mean((u_t - 5 * pred_res * (1 - pred_res)) ** 2)
+        loss_bc = torch.mean((pred_upper - pred_lower) ** 2)
+        loss_ic = torch.mean(
+            (pred_left[:, 0] -
+             torch.exp(-(x_left[:, 0] - torch.pi) ** 2 /
+                       (2 * (torch.pi / 4) ** 2))) ** 2
+        )
+
+        loss = loss_res + loss_bc + loss_ic
+        loss.backward()
+
+        loss_track.append([loss_res.item(), loss_bc.item(), loss_ic.item()])
+        return loss
+
+    optim.step(closure)
+
+    # ===================== SAFE PRECISION SWITCH =====================
+    if (epoch + 1) == SWITCH_EPOCH and not precision_switched:
+        print(f"\n🔁 Switching precision at epoch {epoch+1}: float64 → float32")
+
+        with open(precision_log, 'a') as f:
+            f.write(f"{epoch+1},float64,float32,{time.time()}\n")
+
+        # Switch model
+        model = model.to(torch.float32)
+
+        # Switch tensors
+        x_res = x_res.detach().to(torch.float32).requires_grad_(True)
+        t_res = t_res.detach().to(torch.float32).requires_grad_(True)
+        x_left = x_left.detach().to(torch.float32).requires_grad_(True)
+        t_left = t_left.detach().to(torch.float32).requires_grad_(True)
+        x_right = x_right.detach().to(torch.float32).requires_grad_(True)
+        t_right = t_right.detach().to(torch.float32).requires_grad_(True)
+        x_upper = x_upper.detach().to(torch.float32).requires_grad_(True)
+        t_upper = t_upper.detach().to(torch.float32).requires_grad_(True)
+        x_lower = x_lower.detach().to(torch.float32).requires_grad_(True)
+        t_lower = t_lower.detach().to(torch.float32).requires_grad_(True)
+
+        # Rebuild optimizer (CRITICAL)
+        optim = LBFGS(
+            model.parameters(),
+            line_search_fn='strong_wolfe',
+            tolerance_grad=1e-8,
+            tolerance_change=1e-10
+        )
+
+        precision_switched = True
+
+    # ===================== LOSS LOG =====================
+    lr, lb, li = loss_track[-1]
+    with open(loss_log, 'a') as f:
+        f.write(f"{epoch+1},{lr:.8e},{lb:.8e},{li:.8e},{lr+lb+li:.8e}\n")
+
+# ===================== SAVE =====================
+torch.save(model.state_dict(), f'./results/1dreaction_{args.model}_point.pt')
+print("Training complete.")
