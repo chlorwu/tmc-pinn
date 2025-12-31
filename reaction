@@ -142,7 +142,7 @@ print(f"  Total FLOPs per epoch: {total_flops_per_epoch:.2e}")
 
 flops_track = []
 
-for i in tqdm(range(500)): # epoch changed from 2000 to 500
+for i in tqdm(range(2000)): # epoch changed from 2000 to 500
     # Use a list to store timing info (mutable, can be modified in closure)
     timing_info = [0.0, 0.0]  # [forward_time, backward_time]
     
