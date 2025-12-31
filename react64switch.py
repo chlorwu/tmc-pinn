@@ -155,10 +155,9 @@ total_flops_per_epoch_fp32 = None
 # =======================
 for epoch in tqdm(range(TOTAL_EPOCHS), desc="Training", ncols=100, unit="epoch"):
     timing_info = [0.0, 0.0]
-    grad_norm = None
+    grad_norm_container = [None]  # Use list to allow modification inside closure
 
     def closure():
-        nonlocal grad_norm
         optim.zero_grad()
         fwd_start = time.time()
 
@@ -189,7 +188,7 @@ for epoch in tqdm(range(TOTAL_EPOCHS), desc="Training", ncols=100, unit="epoch")
         for p in model.parameters():
             if p.grad is not None:
                 total_norm += p.grad.data.norm(2).item() ** 2
-        grad_norm = total_norm ** 0.5
+        grad_norm_container[0] = total_norm ** 0.5
 
         loss_track.append([loss_res.item(), loss_bc.item(), loss_ic.item(), loss.item()])
         return loss
@@ -197,6 +196,9 @@ for epoch in tqdm(range(TOTAL_EPOCHS), desc="Training", ncols=100, unit="epoch")
     optim.step(closure)
     loss_res_v, loss_bc_v, loss_ic_v, total_loss_v = loss_track[-1]
     loss_window.append(total_loss_v)
+    
+    # Extract gradient norm from container
+    grad_norm = grad_norm_container[0]
 
     # -----------------------
     # PLATEAU-BASED PRECISION SWITCH
@@ -213,13 +215,14 @@ for epoch in tqdm(range(TOTAL_EPOCHS), desc="Training", ncols=100, unit="epoch")
             for tensor_name in ['x_res','t_res','x_left','t_left','x_right','t_right','x_upper','t_upper','x_lower','t_lower']:
                 globals()[tensor_name] = globals()[tensor_name].to(SWITCH_DTYPE)
             optim = make_optimizer()
-
+            
             # Update FLOPs for FP32
             forward_flops_per_pass_fp32 = estimate_flops(model, (sample_batch_size,))
             backward_flops_per_pass_fp32 = forward_flops_per_pass_fp32 * 2
             total_forward_flops_fp32 = forward_flops_per_pass_fp32 * (num_forward_passes + num_grad_computations * 2)
             total_backward_flops_fp32 = backward_flops_per_pass_fp32 * num_forward_passes
             total_flops_per_epoch_fp32 = total_forward_flops_fp32 + total_backward_flops_fp32
+            
             print(f"Estimated FLOPs per epoch (FP32): {total_flops_per_epoch_fp32:.2e}")
 
     # -----------------------
@@ -245,9 +248,11 @@ for epoch in tqdm(range(TOTAL_EPOCHS), desc="Training", ncols=100, unit="epoch")
     # Write logs
     with open(log_file_path,'a') as f:
         f.write(f"{epoch+1},{loss_res_v:.8e},{loss_bc_v:.8e},{loss_ic_v:.8e},{total_loss_v:.8e},{precision_str}\n")
+    
     with open(flops_log_file_path,'a') as f:
         f.write(f"{epoch+1},{total_forward_flops:.2e},{total_backward_flops:.2e},{total_flops_per_epoch:.2e},"
                 f"{timing_info[0]:.6f},{timing_info[1]:.6f},{epoch_total_time:.6f},{flops_per_sec:.2e},{precision_str}\n")
+    
     if grad_norm is not None:
         with open(gradient_log_file_path,'a') as f:
             f.write(f"{epoch+1},{grad_norm:.8e},{precision_str}\n")
@@ -328,3 +333,29 @@ plt.plot(epochs_flops,fwd_time,'r--',label='Forward Time')
 plt.plot(epochs_flops,bwd_time,'g--',label='Backward Time')
 plt.xlabel('Epoch'); plt.ylabel('Time (s)'); plt.title('Time per Epoch'); plt.legend(); plt.grid(True,alpha=0.3)
 
+plt.subplot(2,2,4)
+plt.semilogy(epochs_flops,np.cumsum(total_flops),'orange',label='Cumulative FLOPs')
+plt.xlabel('Epoch'); plt.ylabel('Cumulative FLOPs'); plt.title('Cumulative FLOPs'); plt.legend(); plt.grid(True,alpha=0.3)
+
+plt.tight_layout()
+plt.savefig(f'./results/1d_reaction_{args.model}_flops_curve.pdf', bbox_inches='tight')
+
+# Gradient norm curve
+try:
+    grad_data = np.loadtxt(gradient_log_file_path, delimiter=',', skiprows=1)
+    epochs_grad = grad_data[:,0]; grad_norms = grad_data[:,1]
+    
+    plt.figure(figsize=(10,6))
+    plt.semilogy(epochs_grad, grad_norms, 'b-', label='Gradient Norm', linewidth=2)
+    plt.xlabel('Epoch'); plt.ylabel('Gradient Norm (log)'); plt.title(f'Gradient Norm - {args.model}'); 
+    plt.legend(); plt.grid(True,alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(f'./results/1d_reaction_{args.model}_gradient_curve.pdf', bbox_inches='tight')
+    print(f'Gradient curve saved to: ./results/1d_reaction_{args.model}_gradient_curve.pdf')
+except Exception as e:
+    print(f'Warning: Could not plot gradient curves: {e}')
+
+print(f'\nResults saved to:')
+print(f'  Loss log: {os.path.abspath(log_file_path)}')
+print(f'  FLOPs log: {os.path.abspath(flops_log_file_path)}')
+print(f'  Gradient log: {os.path.abspath(gradient_log_file_path)}')
