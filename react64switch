@@ -7,21 +7,24 @@ import random
 from torch.optim import LBFGS
 from tqdm import tqdm
 import argparse
+import numpy as np
 from util import *
 from model_dict import get_model
-import numpy as np
 
-# ===================== SEED =====================
+# =======================
+# CONFIG
+# =======================
+TOTAL_EPOCHS = 2000
+SWITCH_LOSS_THRESHOLD = 1e-4   # <<< LOSS-BASED TRIGGER
+START_DTYPE = torch.float64
+SWITCH_DTYPE = torch.float32
+# =======================
+
 seed = 1
 np.random.seed(seed)
 random.seed(seed)
 torch.manual_seed(seed)
 torch.cuda.manual_seed(seed)
-
-# ===================== CONFIG =====================
-step_size = 1e-4
-num_step = 5
-SWITCH_EPOCH = 20   # <-- precision switch happens here (safe point)
 
 parser = argparse.ArgumentParser('Training Point Optimization')
 parser.add_argument('--model', type=str, default='PINN')
@@ -29,33 +32,27 @@ parser.add_argument('--device', type=str, default='cuda:0')
 args = parser.parse_args()
 device = args.device
 
-# ===================== DATA =====================
+# =======================
+# DATA
+# =======================
 res, b_left, b_right, b_upper, b_lower = get_data([0, 2 * np.pi], [0, 1], 101, 101)
 res_test, _, _, _, _ = get_data([0, 2 * np.pi], [0, 1], 101, 101)
 
-if args.model in ['PINNsFormer', 'PINNMamba']:
-    res = make_time_sequence(res, num_step=10, step=step_size)
-    b_left = make_time_sequence(b_left, num_step=num_step, step=step_size)
-    b_right = make_time_sequence(b_right, num_step=num_step, step=step_size)
-    b_upper = make_time_sequence(b_upper, num_step=num_step, step=step_size)
-    b_lower = make_time_sequence(b_lower, num_step=num_step, step=step_size)
+res = torch.tensor(res, dtype=START_DTYPE, requires_grad=True).to(device)
+b_left = torch.tensor(b_left, dtype=START_DTYPE, requires_grad=True).to(device)
+b_right = torch.tensor(b_right, dtype=START_DTYPE, requires_grad=True).to(device)
+b_upper = torch.tensor(b_upper, dtype=START_DTYPE, requires_grad=True).to(device)
+b_lower = torch.tensor(b_lower, dtype=START_DTYPE, requires_grad=True).to(device)
 
-# START IN FP64
-DTYPE = torch.float64
+x_res, t_res = res[:, ..., 0:1], res[:, ..., 1:2]
+x_left, t_left = b_left[:, ..., 0:1], b_left[:, ..., 1:2]
+x_right, t_right = b_right[:, ..., 0:1], b_right[:, ..., 1:2]
+x_upper, t_upper = b_upper[:, ..., 0:1], b_upper[:, ..., 1:2]
+x_lower, t_lower = b_lower[:, ..., 0:1], b_lower[:, ..., 1:2]
 
-res = torch.tensor(res, dtype=DTYPE, requires_grad=True).to(device)
-b_left = torch.tensor(b_left, dtype=DTYPE, requires_grad=True).to(device)
-b_right = torch.tensor(b_right, dtype=DTYPE, requires_grad=True).to(device)
-b_upper = torch.tensor(b_upper, dtype=DTYPE, requires_grad=True).to(device)
-b_lower = torch.tensor(b_lower, dtype=DTYPE, requires_grad=True).to(device)
-
-x_res, t_res = res[..., 0:1], res[..., 1:2]
-x_left, t_left = b_left[..., 0:1], b_left[..., 1:2]
-x_right, t_right = b_right[..., 0:1], b_right[..., 1:2]
-x_upper, t_upper = b_upper[..., 0:1], b_upper[..., 1:2]
-x_lower, t_lower = b_lower[..., 0:1], b_lower[..., 1:2]
-
-# ===================== MODEL =====================
+# =======================
+# MODEL
+# =======================
 def init_weights(m):
     if isinstance(m, nn.Linear):
         nn.init.xavier_uniform_(m.weight)
@@ -63,36 +60,45 @@ def init_weights(m):
 
 model = get_model(args).Model(
     in_dim=2, hidden_dim=1024, out_dim=1, num_layer=6
-).to(DTYPE).to(device)
+).to(START_DTYPE).to(device)
 model.apply(init_weights)
 
-# ===================== OPTIMIZER =====================
-optim = LBFGS(
-    model.parameters(),
-    line_search_fn='strong_wolfe',
-    tolerance_grad=1e-8,
-    tolerance_change=1e-10
-)
+def make_optimizer():
+    return LBFGS(
+        model.parameters(),
+        line_search_fn='strong_wolfe',
+        tolerance_grad=1e-8,
+        tolerance_change=1e-10
+    )
 
-# ===================== LOGGING =====================
-os.makedirs('./results/', exist_ok=True)
+optim = make_optimizer()
 
-loss_log = f'./results/1dreaction_{args.model}_loss_log.txt'
-precision_log = f'./results/precision_switch_log.txt'
+print(model)
+print("Parameters:", sum(p.numel() for p in model.parameters()))
 
-with open(loss_log, 'w') as f:
-    f.write('epoch,loss_res,loss_bc,loss_ic,total_loss\n')
+# =======================
+# LOGGING
+# =======================
+os.makedirs('./results', exist_ok=True)
+log_file_path = f'./results/1dreaction_{args.model}_loss_log.txt'
 
-with open(precision_log, 'w') as f:
-    f.write('epoch,old_dtype,new_dtype,timestamp\n')
+with open(log_file_path, 'w') as f:
+    f.write('epoch,loss_res,loss_bc,loss_ic,total_loss,precision\n')
 
-# ===================== TRAIN =====================
 loss_track = []
 precision_switched = False
+current_dtype = START_DTYPE
 
-for epoch in tqdm(range(2000), desc="Training"):
+# =======================
+# TRAINING
+# =======================
+for epoch in tqdm(range(TOTAL_EPOCHS), desc="Training"):
+    timing_info = [0.0, 0.0]
+
     def closure():
         optim.zero_grad()
+
+        t0 = time.time()
 
         pred_res = model(x_res, t_res)
         pred_left = model(x_left, t_left)
@@ -119,50 +125,71 @@ for epoch in tqdm(range(2000), desc="Training"):
         )
 
         loss = loss_res + loss_bc + loss_ic
-        loss.backward()
 
-        loss_track.append([loss_res.item(), loss_bc.item(), loss_ic.item()])
+        t1 = time.time()
+        loss.backward()
+        t2 = time.time()
+
+        timing_info[0] = t1 - t0
+        timing_info[1] = t2 - t1
+
+        loss_track.append([
+            loss_res.item(),
+            loss_bc.item(),
+            loss_ic.item(),
+            loss.item()
+        ])
+
         return loss
 
     optim.step(closure)
 
-    # ===================== SAFE PRECISION SWITCH =====================
-    if (epoch + 1) == SWITCH_EPOCH and not precision_switched:
-        print(f"\n🔁 Switching precision at epoch {epoch+1}: float64 → float32")
+    loss_res_v, loss_bc_v, loss_ic_v, total_loss_v = loss_track[-1]
 
-        with open(precision_log, 'a') as f:
-            f.write(f"{epoch+1},float64,float32,{time.time()}\n")
+    # =======================
+    # LOSS-BASED PRECISION SWITCH
+    # =======================
+    if (not precision_switched) and total_loss_v < SWITCH_LOSS_THRESHOLD:
+        precision_switched = True
+        current_dtype = SWITCH_DTYPE
 
-        # Switch model
-        model = model.to(torch.float32)
+        print("\n" + "=" * 60)
+        print(f"🔁 PRECISION SWITCH TRIGGERED at epoch {epoch+1}")
+        print(f"   Total loss = {total_loss_v:.3e}")
+        print(f"   Switching model + data → float32")
+        print("=" * 60 + "\n")
 
-        # Switch tensors
-        x_res = x_res.detach().to(torch.float32).requires_grad_(True)
-        t_res = t_res.detach().to(torch.float32).requires_grad_(True)
-        x_left = x_left.detach().to(torch.float32).requires_grad_(True)
-        t_left = t_left.detach().to(torch.float32).requires_grad_(True)
-        x_right = x_right.detach().to(torch.float32).requires_grad_(True)
-        t_right = t_right.detach().to(torch.float32).requires_grad_(True)
-        x_upper = x_upper.detach().to(torch.float32).requires_grad_(True)
-        t_upper = t_upper.detach().to(torch.float32).requires_grad_(True)
-        x_lower = x_lower.detach().to(torch.float32).requires_grad_(True)
-        t_lower = t_lower.detach().to(torch.float32).requires_grad_(True)
+        # Convert model
+        model = model.to(SWITCH_DTYPE)
 
-        # Rebuild optimizer (CRITICAL)
-        optim = LBFGS(
-            model.parameters(),
-            line_search_fn='strong_wolfe',
-            tolerance_grad=1e-8,
-            tolerance_change=1e-10
+        # Convert all tensors
+        for tensor_name in [
+            'x_res', 't_res', 'x_left', 't_left',
+            'x_right', 't_right', 'x_upper', 't_upper',
+            'x_lower', 't_lower'
+        ]:
+            globals()[tensor_name] = globals()[tensor_name].to(SWITCH_DTYPE)
+
+        # VERY IMPORTANT: reset optimizer
+        optim = make_optimizer()
+
+    # =======================
+    # LOG
+    # =======================
+    with open(log_file_path, 'a') as f:
+        f.write(
+            f"{epoch+1},"
+            f"{loss_res_v:.8e},"
+            f"{loss_bc_v:.8e},"
+            f"{loss_ic_v:.8e},"
+            f"{total_loss_v:.8e},"
+            f"{'fp32' if current_dtype == torch.float32 else 'fp64'}\n"
         )
 
-        precision_switched = True
-
-    # ===================== LOSS LOG =====================
-    lr, lb, li = loss_track[-1]
-    with open(loss_log, 'a') as f:
-        f.write(f"{epoch+1},{lr:.8e},{lb:.8e},{li:.8e},{lr+lb+li:.8e}\n")
-
-# ===================== SAVE =====================
-torch.save(model.state_dict(), f'./results/1dreaction_{args.model}_point.pt')
-print("Training complete.")
+# =======================
+# FINAL REPORT
+# =======================
+print("\nTraining complete.")
+print(f"Final loss: {loss_track[-1][-1]:.6e}")
+print(f"Final precision: {'fp32' if current_dtype == torch.float32 else 'fp64'}")
+print(f"Loss log saved to: {os.path.abspath(log_file_path)}")
