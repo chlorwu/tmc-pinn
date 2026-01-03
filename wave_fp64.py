@@ -1,3 +1,4 @@
+import time
 import torch
 import torch.nn as nn
 import os
@@ -84,8 +85,57 @@ log_file_path = f'./results/wave/1dwave_{args.model}_loss_log.txt'
 with open(log_file_path, 'w') as log_file:
     log_file.write('epoch,loss_res,loss_ic,loss_bc,total_loss\n')
 
-for i in tqdm(range(2500)): # epoch changed from 10000 to 2500
+# Open log file for writing FLOPs/FLOPS
+flops_log_file_path = f'./results/wave/1dwave_{args.model}_flops_log.txt'
+with open(flops_log_file_path, 'w') as flops_log_file:
+    flops_log_file.write('epoch,forward_flops,backward_flops,total_flops,forward_time,backward_time,total_time,flops_per_sec\n')
+
+# Function to estimate FLOPs for a forward pass
+def estimate_flops(model, input_shape):
+    """
+    Estimate FLOPs for forward pass.
+    For Linear layers: FLOPs = 2 * in_features * out_features * batch_size
+    """
+    flops = 0
+    batch_size = input_shape[0]
+    
+    for module in model.modules():
+        if isinstance(module, nn.Linear):
+            # Matrix multiplication: in_features * out_features * batch_size
+            # Plus bias addition: out_features * batch_size
+            flops += (2 * module.in_features * module.out_features + module.out_features) * batch_size
+        # Add FLOPs for activation functions (approximate)
+        elif isinstance(module, (nn.ReLU, nn.Tanh, nn.Sigmoid)):
+            flops += batch_size * module.out_features if hasattr(module, 'out_features') else batch_size
+    
+    return flops
+
+# Estimate FLOPs for one forward pass (using x_res shape as reference)
+# Handle different input shapes: (N, 1) or (N, L, 1)
+if len(x_res.shape) >= 2:
+    sample_batch_size = x_res.shape[0]
+    # If 3D, multiply by sequence length for total operations
+    if len(x_res.shape) == 3:
+        sample_batch_size = x_res.shape[0] * x_res.shape[1]
+else:
+    sample_batch_size = 1
+forward_flops_per_pass = estimate_flops(model, (sample_batch_size,))
+# Backward pass typically requires ~2x FLOPs of forward pass
+backward_flops_per_pass = forward_flops_per_pass * 2
+
+flops_track = []
+
+for i in tqdm(range(10000)):
+    # Use a list to store timing info (mutable, can be modified in closure)
+    timing_info = [0.0, 0.0]  # [forward_time, backward_time]
+    
+    # Measure time for the entire closure (forward + backward)
+    epoch_start_time = time.time()
+    
     def closure():
+        # Measure forward pass time
+        forward_start_time = time.time()
+        
         pred_res = model(x_res, t_res)
         pred_left = model(x_left, t_left)
         pred_right = model(x_right, t_right)
@@ -115,15 +165,80 @@ for i in tqdm(range(2500)): # epoch changed from 10000 to 2500
 
         loss_ic = loss_ic_1 + loss_ic_2
 
-        loss_track.append([loss_res.item(), loss_ic.item(), loss_bc.item()])
-        print('Loss Res: {:4f}, Loss_IC: {:4f}, Loss_BC: {:4f}'.format(loss_track[-1][0], loss_track[-1][1], loss_track[-1][2]))
+        forward_end_time = time.time()
+        timing_info[0] = forward_end_time - forward_start_time
+        
         loss = loss_res + loss_ic + loss_bc
         optim.zero_grad()
+        
+        # Measure backward pass time
+        backward_start_time = time.time()
         loss.backward()
+        backward_end_time = time.time()
+        timing_info[1] = backward_end_time - backward_start_time
+        
         return loss
 
 
     optim.step(closure)
+    
+    # Calculate and store losses after the optimizer step (only once per epoch)
+    # Re-compute losses for logging (using the model's current state)
+    pred_res = model(x_res, t_res)
+    pred_left = model(x_left, t_left)
+    pred_upper = model(x_upper, t_upper)
+    pred_lower = model(x_lower, t_lower)
+    
+    u_x = torch.autograd.grad(pred_res, x_res, grad_outputs=torch.ones_like(pred_res), retain_graph=True,
+                              create_graph=True)[0]
+    u_xx = torch.autograd.grad(u_x, x_res, grad_outputs=torch.ones_like(pred_res), retain_graph=True,
+                               create_graph=True)[0]
+    u_t = torch.autograd.grad(pred_res, t_res, grad_outputs=torch.ones_like(pred_res), retain_graph=True,
+                              create_graph=True)[0]
+    u_tt = torch.autograd.grad(u_t, t_res, grad_outputs=torch.ones_like(pred_res), retain_graph=True,
+                               create_graph=True)[0]
+    
+    loss_res = torch.mean((u_tt - 4 * u_xx) ** 2)
+    loss_bc = torch.mean((pred_upper) ** 2) + torch.mean((pred_lower) ** 2)
+    
+    ui_t = torch.autograd.grad(pred_left, t_left, grad_outputs=torch.ones_like(pred_left), retain_graph=True,
+                               create_graph=True)[0]
+    loss_ic_1 = torch.mean(
+        (pred_left[:, 0] - torch.sin(pi * x_left[:, 0]) - 0.5 * torch.sin(3 * pi * x_left[:, 0])) ** 2)
+    loss_ic_2 = torch.mean((ui_t) ** 2)
+    loss_ic = loss_ic_1 + loss_ic_2
+    
+    loss_track.append([loss_res.item(), loss_ic.item(), loss_bc.item()])
+    
+    epoch_end_time = time.time()
+    total_time = epoch_end_time - epoch_start_time
+    
+    # Calculate FLOPs and FLOPS
+    # Count number of forward passes (5 model calls: pred_res, pred_left, pred_right, pred_upper, pred_lower)
+    # Plus 5 gradient computations: u_x, u_xx, u_t, u_tt, ui_t
+    num_forward_passes = 5
+    num_grad_computations = 5
+    
+    # Estimate FLOPs: each forward pass through model + gradient computations
+    # Gradient computations add significant FLOPs (roughly 2-3x forward pass)
+    forward_flops = forward_flops_per_pass * num_forward_passes
+    # Gradient computations are computationally expensive
+    grad_flops = forward_flops_per_pass * num_grad_computations * 2  # 2x multiplier for gradient computation
+    total_forward_flops = forward_flops + grad_flops
+    total_backward_flops = backward_flops_per_pass * num_forward_passes  # Approximate backward FLOPs
+    total_flops = total_forward_flops + total_backward_flops
+    
+    # Get timing from closure
+    forward_time_measured = timing_info[0] if timing_info[0] > 0 else total_time * 0.6
+    backward_time_measured = timing_info[1] if timing_info[1] > 0 else total_time * 0.4
+    
+    # Calculate FLOPS (FLOPs per second)
+    if total_time > 0:
+        flops_per_sec = total_flops / total_time
+    else:
+        flops_per_sec = 0.0
+    
+    flops_track.append([total_forward_flops, total_backward_flops, total_flops, forward_time_measured, backward_time_measured, total_time, flops_per_sec])
     
     # Log losses to file after each epoch
     if len(loss_track) > 0:
@@ -134,6 +249,11 @@ for i in tqdm(range(2500)): # epoch changed from 10000 to 2500
         
         with open(log_file_path, 'a') as log_file:
             log_file.write(f'{i+1},{loss_res_val:.8e},{loss_ic_val:.8e},{loss_bc_val:.8e},{total_loss_val:.8e}\n')
+    
+    # Log FLOPs/FLOPS to file after each epoch
+    with open(flops_log_file_path, 'a') as flops_log_file:
+        flops_log_file.write(f'{i+1},{total_forward_flops:.2e},{total_backward_flops:.2e},{total_flops:.2e},'
+                            f'{forward_time_measured:.6f},{backward_time_measured:.6f},{total_time:.6f},{flops_per_sec:.2e}\n')
 
 print('Loss Res: {:4f}, Loss_BC: {:4f}, Loss_IC: {:4f}'.format(loss_track[-1][0], loss_track[-1][1], loss_track[-1][2]))
 print('Train Loss: {:4f}'.format(np.sum(loss_track[-1])))
@@ -229,4 +349,70 @@ try:
     print(f'Loss curve plot saved at: ./results/wave/1dwave_{args.model}_loss_curve.pdf')
 except Exception as e:
     print(f'\nWarning: Could not read loss log file or create plot: {e}')
+
+# Plot FLOPs/FLOPS curves from log file
+try:
+    # Load the FLOPs data
+    flops_data = np.loadtxt(flops_log_file_path, delimiter=',', skiprows=1)
+    epochs_flops = flops_data[:, 0]
+    forward_flops = flops_data[:, 1]
+    backward_flops = flops_data[:, 2]
+    total_flops = flops_data[:, 3]
+    forward_time = flops_data[:, 4]
+    backward_time = flops_data[:, 5]
+    total_time = flops_data[:, 6]
+    flops_per_sec = flops_data[:, 7]
+    
+    # Create FLOPs vs epoch plot
+    plt.figure(figsize=(12, 8))
+    
+    # Subplot 1: FLOPs breakdown
+    plt.subplot(2, 2, 1)
+    plt.semilogy(epochs_flops, total_flops, 'b-', label='Total FLOPs', linewidth=2)
+    plt.semilogy(epochs_flops, forward_flops, 'r--', label='Forward FLOPs', linewidth=1.5, alpha=0.7)
+    plt.semilogy(epochs_flops, backward_flops, 'g--', label='Backward FLOPs', linewidth=1.5, alpha=0.7)
+    plt.xlabel('Epoch', fontsize=12)
+    plt.ylabel('FLOPs (log scale)', fontsize=12)
+    plt.title(f'FLOPs vs Epoch - {args.model}', fontsize=14)
+    plt.legend(fontsize=10)
+    plt.grid(True, alpha=0.3)
+    
+    # Subplot 2: FLOPS (FLOPs per second)
+    plt.subplot(2, 2, 2)
+    plt.plot(epochs_flops, flops_per_sec, 'purple', label='FLOPS', linewidth=2)
+    plt.xlabel('Epoch', fontsize=12)
+    plt.ylabel('FLOPS (FLOPs per second)', fontsize=12)
+    plt.title(f'FLOPS vs Epoch - {args.model}', fontsize=14)
+    plt.legend(fontsize=10)
+    plt.grid(True, alpha=0.3)
+    plt.yscale('log')
+    
+    # Subplot 3: Time breakdown
+    plt.subplot(2, 2, 3)
+    plt.plot(epochs_flops, total_time, 'b-', label='Total Time', linewidth=2)
+    plt.plot(epochs_flops, forward_time, 'r--', label='Forward Time', linewidth=1.5, alpha=0.7)
+    plt.plot(epochs_flops, backward_time, 'g--', label='Backward Time', linewidth=1.5, alpha=0.7)
+    plt.xlabel('Epoch', fontsize=12)
+    plt.ylabel('Time (seconds)', fontsize=12)
+    plt.title(f'Time per Epoch - {args.model}', fontsize=14)
+    plt.legend(fontsize=10)
+    plt.grid(True, alpha=0.3)
+    
+    # Subplot 4: Cumulative FLOPs
+    plt.subplot(2, 2, 4)
+    cumulative_flops = np.cumsum(total_flops)
+    plt.semilogy(epochs_flops, cumulative_flops, 'orange', label='Cumulative FLOPs', linewidth=2)
+    plt.xlabel('Epoch', fontsize=12)
+    plt.ylabel('Cumulative FLOPs (log scale)', fontsize=12)
+    plt.title(f'Cumulative FLOPs - {args.model}', fontsize=14)
+    plt.legend(fontsize=10)
+    plt.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig(f'./results/wave/1dwave_{args.model}_flops_curve.pdf', bbox_inches='tight')
+    plt.close()
+    print(f'FLOPs/FLOPS curve saved to: ./results/wave/1dwave_{args.model}_flops_curve.pdf')
+    print(f'FLOPs log file location: {os.path.abspath(flops_log_file_path)}')
+except Exception as e:
+    print(f'Warning: Could not plot FLOPs/FLOPS curves: {e}')
 
