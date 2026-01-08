@@ -1,52 +1,50 @@
 import time
-import os
 import torch
 import torch.nn as nn
 import matplotlib.pyplot as plt
 import random
-import argparse
 import numpy as np
-from collections import deque
-from torch.optim import LBFGS
+from torch.optim import LBFGS, Adam
 from tqdm import tqdm
+import os
+import argparse
 from util import *
 from model_dict import get_model
 
-# =======================
-# CONFIG
-# =======================
-TOTAL_EPOCHS = 50000
-
-START_DTYPE = torch.float64
-SWITCH_DTYPE = torch.float32
-
-PLATEAU_WINDOW = 100
-PLATEAU_EPS = 1e-4
-
-step_size = 1e-4
-num_step = 5
-beta = 50
-# =======================
-
+# --------------------------
+# Seed
+# --------------------------
 seed = 0
 np.random.seed(seed)
 random.seed(seed)
 torch.manual_seed(seed)
 torch.cuda.manual_seed(seed)
 
-parser = argparse.ArgumentParser()
+# --------------------------
+# Hyperparameters
+# --------------------------
+step_size = 1e-4
+num_step = 5
+beta = 50
+switch_epoch = 2500  # Epoch to switch precision from float32 to float64
+max_epochs = 50000
+
+# --------------------------
+# Argument parser
+# --------------------------
+parser = argparse.ArgumentParser('Training Point Optimization')
 parser.add_argument('--model', type=str, default='PINN')
 parser.add_argument('--device', type=str, default='cuda:0')
 args = parser.parse_args()
 device = args.device
 
-# =======================
-# DATA
-# =======================
-res, b_left, b_right, b_upper, b_lower = get_data([0, 2*np.pi], [0,1], 401, 401)
-res_test, _, _, _, _ = get_data([0, 2*np.pi], [0,1], 101, 101)
+# --------------------------
+# Data
+# --------------------------
+res, b_left, b_right, b_upper, b_lower = get_data([0, 2 * np.pi], [0, 1], 401, 401)
+res_test, b_left_test, _, _, _ = get_data([0, 2 * np.pi], [0, 1], 101, 101)
 
-if args.model in ['PINNsFormer','PINNMamba']:
+if args.model in ['PINNsFormer', 'PINNMamba']:
     res = make_time_sequence(res, num_step=num_step, step=step_size)
     b_left = make_time_sequence(b_left, num_step=num_step, step=step_size)
     b_right = make_time_sequence(b_right, num_step=num_step, step=step_size)
@@ -54,176 +52,292 @@ if args.model in ['PINNsFormer','PINNMamba']:
     b_lower = make_time_sequence(b_lower, num_step=num_step, step=step_size)
     res_test = make_time_sequence(res_test, num_step=num_step, step=step_size)
 
-# residual needs grad
-res = torch.tensor(res, dtype=START_DTYPE, requires_grad=True).to(device)
+# Convert to tensors with requires_grad=True
+res = torch.tensor(res, dtype=torch.float32, requires_grad=True).to(device)
+b_left = torch.tensor(b_left, dtype=torch.float32, requires_grad=True).to(device)
+b_right = torch.tensor(b_right, dtype=torch.float32, requires_grad=True).to(device)
+b_upper = torch.tensor(b_upper, dtype=torch.float32, requires_grad=True).to(device)
+b_lower = torch.tensor(b_lower, dtype=torch.float32, requires_grad=True).to(device)
 
-# boundaries do NOT
-b_left  = torch.tensor(b_left,  dtype=START_DTYPE).to(device)
-b_right = torch.tensor(b_right, dtype=START_DTYPE).to(device)
-b_upper = torch.tensor(b_upper, dtype=START_DTYPE).to(device)
-b_lower = torch.tensor(b_lower, dtype=START_DTYPE).to(device)
+x_res, t_res = res[..., 0:1], res[..., 1:2]
+x_left, t_left = b_left[..., 0:1], b_left[..., 1:2]
+x_right, t_right = b_right[..., 0:1], b_right[..., 1:2]
+x_upper, t_upper = b_upper[..., 0:1], b_upper[..., 1:2]
+x_lower, t_lower = b_lower[..., 0:1], b_lower[..., 1:2]
 
-x_res, t_res = res[...,0:1], res[...,1:2]
-x_left, t_left = b_left[...,0:1], b_left[...,1:2]
-x_right, t_right = b_right[...,0:1], b_right[...,1:2]
-x_upper, t_upper = b_upper[...,0:1], b_upper[...,1:2]
-x_lower, t_lower = b_lower[...,0:1], b_lower[...,1:2]
-
-# =======================
-# MODEL
-# =======================
+# --------------------------
+# Model initialization
+# --------------------------
 def init_weights(m):
     if isinstance(m, nn.Linear):
         torch.nn.init.xavier_uniform_(m.weight)
-        m.bias.data.zero_()
+        if m.bias is not None:
+            m.bias.data.fill_(0.0)
 
-if args.model == 'QRes':
-    model = get_model(args).Model(2,256,1,4).to(START_DTYPE).to(device)
-elif args.model in ['PINNsFormer','PINNsFormer_Enc_Only']:
-    model = get_model(args).Model(2,32,1,1).to(START_DTYPE).to(device)
+if args.model == 'KAN':
+    model = get_model(args).Model(width=[2, 5, 5, 1], grid=5, k=3, grid_eps=1.0, noise_scale_base=0.25, device=device).to(device)
+elif args.model == 'QRes':
+    model = get_model(args).Model(in_dim=2, hidden_dim=256, out_dim=1, num_layer=4).to(device)
+    model.apply(init_weights)
+elif args.model in ['PINNsFormer', 'PINNsFormer_Enc_Only']:
+    model = get_model(args).Model(in_dim=2, hidden_dim=32, out_dim=1, num_layer=1).to(device)
+    model.apply(init_weights)
 else:
-    model = get_model(args).Model(2,512,1,4).to(START_DTYPE).to(device)
+    model = get_model(args).Model(in_dim=2, hidden_dim=512, out_dim=1, num_layer=4).to(device)
+    model.apply(init_weights)
 
-model.apply(init_weights)
+# --------------------------
+# Optimizer
+# --------------------------
+optim = LBFGS(model.parameters(), line_search_fn='strong_wolfe', tolerance_grad=1e-8, tolerance_change=1e-10)
 
-def make_optimizer():
-    return LBFGS(
-        model.parameters(),
-        line_search_fn='strong_wolfe',
-        tolerance_grad=1e-8,
-        tolerance_change=1e-10
-    )
+# --------------------------
+# Logging setup
+# --------------------------
+os.makedirs('./results/', exist_ok=True)
+loss_log_file = f'./results/1dconvection_{args.model}_{num_step}_{step_size}_{beta}_loss_log.txt'
+with open(loss_log_file, 'w') as f:
+    f.write('epoch,loss_res,loss_bc,loss_ic,total_loss\n')
 
-optim = make_optimizer()
+flops_log_file = f'./results/1dconvection_{args.model}_{num_step}_{step_size}_{beta}_flops_log.txt'
+with open(flops_log_file, 'w') as f:
+    f.write('epoch,forward_flops,backward_flops,total_flops,forward_time,backward_time,total_time,flops_per_sec\n')
 
-print(model)
-print("Parameters:", sum(p.numel() for p in model.parameters()))
+# --------------------------
+# FLOPs estimation
+# --------------------------
+def estimate_flops(model, input_shape):
+    flops = 0
+    batch_size = input_shape[0]
+    for module in model.modules():
+        if isinstance(module, nn.Linear):
+            flops += (2 * module.in_features * module.out_features + module.out_features) * batch_size
+        elif isinstance(module, (nn.ReLU, nn.Tanh, nn.Sigmoid)):
+            flops += batch_size * getattr(module, 'out_features', 1)
+    return flops
 
-# =======================
-# LOGGING
-# =======================
-os.makedirs('./results', exist_ok=True)
-loss_log = f'./results/1dconvection_{args.model}_loss_log.txt'
+if len(x_res.shape) >= 2:
+    sample_batch_size = x_res.shape[0] * (x_res.shape[1] if len(x_res.shape) == 3 else 1)
+else:
+    sample_batch_size = 1
 
-with open(loss_log, 'w') as f:
-    f.write("epoch,loss_res,loss_bc,loss_ic,total_loss,precision\n")
+forward_flops_per_pass = estimate_flops(model, (sample_batch_size,))
+backward_flops_per_pass = 2 * forward_flops_per_pass
 
-# =======================
-# SWITCH STATE
-# =======================
-precision_switched = False
-current_dtype = START_DTYPE
-precision_switch_epoch = None
-loss_window = deque(maxlen=PLATEAU_WINDOW)
+# --------------------------
+# Training loop
+# --------------------------
+loss_track = []
+gradient_stats = []
+flops_track = []
 
-# =======================
-# TRAINING LOOP
-# =======================
-for epoch in tqdm(range(TOTAL_EPOCHS), desc="Training", ncols=100):
+for epoch in tqdm(range(max_epochs)):
+
+    # --------------------------
+    # Precision switch
+    # --------------------------
+    if epoch == switch_epoch:
+        model = model.to(torch.float64)
+        x_res, t_res = x_res.to(torch.float64), t_res.to(torch.float64)
+        x_left, t_left = x_left.to(torch.float64), t_left.to(torch.float64)
+        x_right, t_right = x_right.to(torch.float64), t_right.to(torch.float64)
+        x_upper, t_upper = x_upper.to(torch.float64), t_upper.to(torch.float64)
+        x_lower, t_lower = x_lower.to(torch.float64), t_lower.to(torch.float64)
+
+    timing_info = [0.0, 0.0]
 
     def closure():
-        optim.zero_grad()
+        forward_start = time.time()
 
-        pred_res   = model(x_res, t_res)
-        pred_left  = model(x_left, t_left)
+        pred_res = model(x_res, t_res)
+        pred_left = model(x_left, t_left)
+        pred_right = model(x_right, t_right)
         pred_upper = model(x_upper, t_upper)
         pred_lower = model(x_lower, t_lower)
 
-        u_x = torch.autograd.grad(
-            pred_res, x_res,
-            torch.ones_like(pred_res),
-            retain_graph=True, create_graph=True
-        )[0]
-
-        u_t = torch.autograd.grad(
-            pred_res, t_res,
-            torch.ones_like(pred_res),
-            retain_graph=True, create_graph=True
-        )[0]
+        u_x = torch.autograd.grad(pred_res, x_res, grad_outputs=torch.ones_like(pred_res),
+                                  retain_graph=True, create_graph=True)[0]
+        u_t = torch.autograd.grad(pred_res, t_res, grad_outputs=torch.ones_like(pred_res),
+                                  retain_graph=True, create_graph=True)[0]
 
         loss_res = torch.mean((u_t + beta * u_x) ** 2)
-        loss_bc  = torch.mean((pred_upper - pred_lower) ** 2)
-        loss_ic  = torch.mean((pred_left[:, 0] - torch.sin(x_left[:, 0])) ** 2)
+        loss_bc = torch.mean((pred_upper - pred_lower) ** 2)
+        loss_ic = torch.mean((pred_left[:, 0] - torch.sin(x_left[:, 0])) ** 2)
+
+        forward_end = time.time()
+        timing_info[0] = forward_end - forward_start
 
         loss = loss_res + loss_bc + loss_ic
+        optim.zero_grad()
+
+        backward_start = time.time()
         loss.backward()
+        backward_end = time.time()
+        timing_info[1] = backward_end - backward_start
+
+        loss_track.append([loss_res.item(), loss_bc.item(), loss_ic.item()])
         return loss
 
-    loss = optim.step(closure)
+    optim.step(closure)
 
-    # recompute losses ONCE for logging
-    with torch.no_grad():
-        pred_res   = model(x_res, t_res)
-        pred_left  = model(x_left, t_left)
-        pred_upper = model(x_upper, t_upper)
-        pred_lower = model(x_lower, t_lower)
+    total_time = sum(timing_info)
+    # Compute FLOPs dynamically
+    num_forward_passes = 5
+    num_grad_computations = 2
+    forward_flops = forward_flops_per_pass * num_forward_passes
+    grad_flops = forward_flops_per_pass * num_grad_computations * 2
+    total_forward_flops = forward_flops + grad_flops
+    total_backward_flops = backward_flops_per_pass * num_forward_passes
+    total_flops = total_forward_flops + total_backward_flops
+    flops_per_sec = total_flops / total_time if total_time > 0 else 0.0
+    flops_track.append([total_forward_flops, total_backward_flops, total_flops, timing_info[0], timing_info[1], total_time, flops_per_sec])
 
-        u_x = torch.autograd.grad(pred_res, x_res,
-                                  torch.ones_like(pred_res),
-                                  retain_graph=True, create_graph=True)[0]
-        u_t = torch.autograd.grad(pred_res, t_res,
-                                  torch.ones_like(pred_res),
-                                  retain_graph=True, create_graph=True)[0]
+    # Logging
+    with open(loss_log_file, 'a') as f:
+        lres, lbc, lic = loss_track[-1]
+        f.write(f'{epoch},{lres:.10e},{lbc:.10e},{lic:.10e},{lres + lbc + lic:.10e}\n')
 
-        loss_res_v = torch.mean((u_t + beta*u_x)**2).item()
-        loss_bc_v  = torch.mean((pred_upper - pred_lower)**2).item()
-        loss_ic_v  = torch.mean((pred_left[:,0] - torch.sin(x_left[:,0]))**2).item()
-        total_loss_v = loss_res_v + loss_bc_v + loss_ic_v
+    with open(flops_log_file, 'a') as f:
+        f.write(f'{epoch+1},{total_forward_flops:.2e},{total_backward_flops:.2e},{total_flops:.2e},'
+                f'{timing_info[0]:.6f},{timing_info[1]:.6f},{total_time:.6f},{flops_per_sec:.2e}\n')
 
-    loss_window.append(total_loss_v)
+    # Gradient stats after 50 epochs
+    if epoch > 50:
+        grad_norms, grad_means, grad_stds = [], [], []
+        for name, param in model.named_parameters():
+            if param.grad is not None:
+                grad_norms.append(param.grad.norm().item())
+                grad_means.append(param.grad.mean().item())
+                grad_stds.append(param.grad.std().item())
+        gradient_stats.append({'step': epoch, 'grad_norms': grad_norms, 'grad_means': grad_means, 'grad_stds': grad_stds})
 
-    # =======================
-    # PLATEAU SWITCH
-    # =======================
-    if (not precision_switched) and len(loss_window) == PLATEAU_WINDOW:
-        Lmax, Lmin = max(loss_window), min(loss_window)
-        delta = (Lmax - Lmin) / max(Lmin, 1e-12)
+# --------------------------
+# Save model
+# --------------------------
+torch.save(model.state_dict(), f'./results/1dconvection_{args.model}_{num_step}_{step_size}.pt')
 
-        if delta < PLATEAU_EPS:
-            precision_switched = True
-            precision_switch_epoch = epoch + 1
-            current_dtype = SWITCH_DTYPE
+# --------------------------
+# Evaluation on test data
+# --------------------------
+res_test = torch.tensor(res_test, dtype=torch.float64, requires_grad=True).to(device)
+x_test, t_test = res_test[..., 0:1], res_test[..., 1:2]
 
-            print(
-                f"\n============================================================\n"
-                f"🔁 PRECISION SWITCH at epoch {precision_switch_epoch}\n"
-                f"   Loss       = {total_loss_v:.3e}\n"
-                f"   Plateau Δ  = {delta:.3e}\n"
-                f"   FP64 → FP32\n"
-                f"============================================================\n"
-            )
+pred = model(x_test, t_test)
+pred = pred.cpu().detach().numpy().reshape(101, 101)
 
-            model = model.to(SWITCH_DTYPE)
-            for name in [
-                'x_res','t_res','x_left','t_left',
-                'x_right','t_right','x_upper','t_upper',
-                'x_lower','t_lower'
-            ]:
-                globals()[name] = globals()[name].to(SWITCH_DTYPE)
+def u_res(x, t):
+    return np.sin(x - beta * t)
 
-            optim = make_optimizer()
+res_test, _, _, _, _ = get_data([0, 2 * np.pi], [0, 1], 101, 101)
+u = u_res(res_test[:, 0], res_test[:, 1]).reshape(101, 101)
 
-    precision_str = 'fp32' if current_dtype == torch.float32 else 'fp64'
+rl1 = np.sum(np.abs(u - pred)) / np.sum(np.abs(u))
+rl2 = np.sqrt(np.sum((u - pred) ** 2) / np.sum(u ** 2))
 
-    with open(loss_log, 'a') as f:
-        f.write(
-            f"{epoch+1},"
-            f"{loss_res_v:.8e},"
-            f"{loss_bc_v:.8e},"
-            f"{loss_ic_v:.8e},"
-            f"{total_loss_v:.8e},"
-            f"{precision_str}\n"
-        )
+print(beta)
+print('relative L1 error: {:4f}'.format(rl1))
+print('relative L2 error: {:4f}'.format(rl2))
 
-# =======================
-# SAVE
-# =======================
-torch.save(
-    model.state_dict(),
-    f'./results/1dconvection_{args.model}_ptps.pt'
-)
+# --------------------------
+# Plotting everything
+# --------------------------
+# Loss
+loss_data = np.loadtxt(loss_log_file, delimiter=',', skiprows=1)
+epochs = loss_data[:, 0]
+loss_res = loss_data[:, 1]
+loss_bc = loss_data[:, 2]
+loss_ic = loss_data[:, 3]
+total_loss = loss_data[:, 4]
 
-print("\nTraining complete.")
-print("Final loss:", total_loss_v)
-print("Final precision:", precision_str)
-print("Loss log:", os.path.abspath(loss_log))
+plt.figure(figsize=(12, 8))
+plt.subplot(2, 1, 1)
+plt.plot(epochs, loss_res, label='Loss Res', alpha=0.7)
+plt.plot(epochs, loss_bc, label='Loss BC', alpha=0.7)
+plt.plot(epochs, loss_ic, label='Loss IC', alpha=0.7)
+plt.xlabel('Epoch')
+plt.ylabel('Loss')
+plt.title('Individual Loss Components')
+plt.legend()
+plt.grid(True, alpha=0.3)
+plt.yscale('log')
+
+plt.subplot(2, 1, 2)
+plt.plot(epochs, total_loss, label='Total Loss', color='red', linewidth=2)
+plt.xlabel('Epoch')
+plt.ylabel('Total Loss')
+plt.title('Total Loss vs Epoch')
+plt.legend()
+plt.grid(True, alpha=0.3)
+plt.yscale('log')
+plt.tight_layout()
+plt.savefig(f'./results/1d_convection_{args.model}_{beta}_loss_vs_epoch.pdf')
+plt.close()
+
+# Gradient plots
+grad_norms_history = [s['grad_norms'] for s in gradient_stats]
+grad_means_history = [s['grad_means'] for s in gradient_stats]
+grad_stds_history = [s['grad_stds'] for s in gradient_stats]
+
+plt.figure(figsize=(10, 6))
+for i in range(len(grad_norms_history[0])):
+    plt.plot([s[i] for s in grad_norms_history], label=f'Layer {i+1}')
+plt.xlabel('Training Step')
+plt.ylabel('Gradient Norm')
+plt.title('Gradient Norms During Training')
+plt.legend()
+plt.grid()
+plt.savefig(f'./results/1d_convection_{args.model}_{beta}_gradient_norms.pdf')
+plt.close()
+
+plt.figure(figsize=(10, 6))
+for i in range(len(grad_means_history[0])):
+    plt.plot([s[i] for s in grad_means_history], label=f'Layer {i+1}')
+plt.xlabel('Training Step')
+plt.ylabel('Gradient Mean')
+plt.title('Gradient Means During Training')
+plt.legend()
+plt.grid()
+plt.savefig(f'./results/1d_convection_{args.model}_{beta}_gradient_means.pdf')
+plt.close()
+
+plt.figure(figsize=(10, 6))
+for i in range(len(grad_stds_history[0])):
+    plt.plot([s[i] for s in grad_stds_history], label=f'Layer {i+1}')
+plt.xlabel('Training Step')
+plt.ylabel('Gradient Std')
+plt.title('Gradient Stds During Training')
+plt.legend()
+plt.grid()
+plt.savefig(f'./results/1d_convection_{args.model}_{beta}_gradient_stds.pdf')
+plt.close()
+
+# Prediction heatmaps
+plt.figure(figsize=(4, 3))
+plt.imshow(pred, extent=[0, 2*np.pi, 1, 0], aspect='auto')
+plt.xlabel('x')
+plt.ylabel('t')
+plt.title('Predicted u(x,t)')
+plt.colorbar()
+plt.tight_layout()
+plt.savefig(f'./results/convection_{args.model}_{num_step}_{step_size}_{beta}_pred.pdf')
+plt.close()
+
+plt.figure(figsize=(4, 3))
+plt.imshow(u, extent=[0, 2*np.pi, 1, 0], aspect='auto')
+plt.xlabel('x')
+plt.ylabel('t')
+plt.title('Exact u(x,t)')
+plt.colorbar()
+plt.tight_layout()
+plt.savefig(f'./results/convection_exact_{beta}.pdf')
+plt.close()
+
+plt.figure(figsize=(4, 3))
+plt.imshow(pred - u, extent=[0, 2*np.pi, 1, 0], aspect='auto', cmap='coolwarm')
+plt.xlabel('x')
+plt.ylabel('t')
+plt.title('Absolute Error')
+plt.colorbar()
+plt.tight_layout()
+plt.savefig(f'./results/convection_{args.model}_{num_step}_{step_size}_{beta}_error.pdf')
+plt.close()
