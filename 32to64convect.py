@@ -62,7 +62,6 @@ if args.model in ['PINNsFormer', 'PINNMamba']:
 
 res = torch.tensor(res, dtype=START_DTYPE, requires_grad=True).to(device)
 b_left = torch.tensor(b_left, dtype=START_DTYPE, requires_grad=True).to(device)
-b_right = torch.tensor(b_right, dtype=START_DTYPE, requires_grad=True).to(device)
 b_upper = torch.tensor(b_upper, dtype=START_DTYPE, requires_grad=True).to(device)
 b_lower = torch.tensor(b_lower, dtype=START_DTYPE, requires_grad=True).to(device)
 
@@ -122,6 +121,9 @@ optimizer = adam
 os.makedirs('./results', exist_ok=True)
 
 loss_hist = []
+loss_res_hist = []
+loss_bc_hist = []
+loss_ic_hist = []
 grad_hist = []
 time_hist = []
 precision_hist = []
@@ -134,6 +136,11 @@ for epoch in tqdm(range(TOTAL_EPOCHS), ncols=100):
     timing_fwd = [0.0]
     timing_bwd = [0.0]
     grad_norm_box = [0.0]
+
+    # containers for logging (LBFGS-safe)
+    loss_res_box = [0.0]
+    loss_bc_box  = [0.0]
+    loss_ic_box  = [0.0]
 
     def closure():
         optimizer.zero_grad()
@@ -163,6 +170,10 @@ for epoch in tqdm(range(TOTAL_EPOCHS), ncols=100):
 
         loss = loss_res + loss_bc + loss_ic
 
+        loss_res_box[0] = loss_res.item()
+        loss_bc_box[0]  = loss_bc.item()
+        loss_ic_box[0]  = loss_ic.item()
+
         timing_fwd[0] = time.time() - t0
 
         t1 = time.time()
@@ -175,12 +186,12 @@ for epoch in tqdm(range(TOTAL_EPOCHS), ncols=100):
                 grad_sq += p.grad.norm().item()**2
         grad_norm_box[0] = grad_sq**0.5
 
-        return loss, loss_res, loss_bc, loss_ic
+        return loss   # 🔴 LBFGS REQUIRES SCALAR ONLY
 
     if isinstance(optimizer, LBFGS):
-        loss, lr, lb, li = optimizer.step(closure)
+        loss = optimizer.step(closure)
     else:
-        loss, lr, lb, li = closure()
+        loss = closure()
         optimizer.step()
 
     # =======================
@@ -204,6 +215,9 @@ for epoch in tqdm(range(TOTAL_EPOCHS), ncols=100):
     precision = 'fp32' if model.parameters().__next__().dtype == torch.float32 else 'fp64'
 
     loss_hist.append(loss.item())
+    loss_res_hist.append(loss_res_box[0])
+    loss_bc_hist.append(loss_bc_box[0])
+    loss_ic_hist.append(loss_ic_box[0])
     grad_hist.append(grad_norm_box[0])
     time_hist.append(timing_fwd[0] + timing_bwd[0])
     precision_hist.append(precision)
@@ -214,18 +228,18 @@ for epoch in tqdm(range(TOTAL_EPOCHS), ncols=100):
 torch.save(model.state_dict(), './results/convect_adam32_lbfgs64.pt')
 
 # =======================
-# PLOTS (WITH SWITCH MARKER)
+# PLOTS
 # =======================
 epochs = np.arange(len(loss_hist))
 
 plt.figure(figsize=(6,4))
 plt.semilogy(epochs, loss_hist)
-plt.axvline(SWITCH_EPOCH, color='red', linestyle='--', label='Precision / Optim Switch')
+plt.axvline(SWITCH_EPOCH, color='red', linestyle='--', label='Switch')
+plt.legend()
 plt.xlabel('Epoch')
 plt.ylabel('Total Loss')
-plt.legend()
 plt.tight_layout()
-plt.savefig('./results/loss_with_switch.pdf')
+plt.savefig('./results/loss_switch.pdf')
 plt.close()
 
 plt.figure(figsize=(6,4))
@@ -234,14 +248,14 @@ plt.axvline(SWITCH_EPOCH, color='red', linestyle='--')
 plt.xlabel('Epoch')
 plt.ylabel('Gradient Norm')
 plt.tight_layout()
-plt.savefig('./results/grad_norm_with_switch.pdf')
+plt.savefig('./results/grad_switch.pdf')
 plt.close()
 
 plt.figure(figsize=(6,4))
 plt.plot(epochs, time_hist)
 plt.axvline(SWITCH_EPOCH, color='red', linestyle='--')
 plt.xlabel('Epoch')
-plt.ylabel('Time per Epoch (s)')
+plt.ylabel('Time / Epoch (s)')
 plt.tight_layout()
-plt.savefig('./results/time_with_switch.pdf')
+plt.savefig('./results/time_switch.pdf')
 plt.close()
