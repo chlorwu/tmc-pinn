@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 import matplotlib.pyplot as plt
 import random
-from torch.optim import LBFGS, Adam
+from torch.optim import Adam
 from tqdm import tqdm
 import argparse
 import numpy as np
@@ -15,14 +15,10 @@ from model_dict import get_model
 # CONFIG
 # =======================
 TOTAL_EPOCHS = 50000
-SWITCH_EPOCH = 3000          # Adam → LBFGS
-START_DTYPE = torch.float32
-SWITCH_DTYPE = torch.float64
-
 STEP_SIZE = 1e-4
 NUM_STEP = 5
 BETA = 50
-# =======================
+DTYPE = torch.float32  # Adam32 only
 
 # =======================
 # SEED
@@ -45,14 +41,10 @@ device = args.device
 # =======================
 # DATA
 # =======================
-res, b_left, b_right, b_upper, b_lower = get_data(
-    [0, 2*np.pi], [0,1], 401, 401
-)
-res_test, b_left_test, _, _, _ = get_data(
-    [0, 2*np.pi], [0,1], 101, 101
-)
+res, b_left, b_right, b_upper, b_lower = get_data([0, 2*np.pi], [0,1], 401, 401)
+res_test, b_left_test, _, _, _ = get_data([0, 2*np.pi], [0,1], 101, 101)
 
-if args.model in ['PINNsFormer', 'PINNMamba']:
+if args.model in ['PINNsFormer','PINNMamba']:
     res = make_time_sequence(res, NUM_STEP, STEP_SIZE)
     b_left = make_time_sequence(b_left, NUM_STEP, STEP_SIZE)
     b_right = make_time_sequence(b_right, NUM_STEP, STEP_SIZE)
@@ -60,15 +52,19 @@ if args.model in ['PINNsFormer', 'PINNMamba']:
     b_lower = make_time_sequence(b_lower, NUM_STEP, STEP_SIZE)
     res_test = make_time_sequence(res_test, NUM_STEP, STEP_SIZE)
 
-res = torch.tensor(res, dtype=START_DTYPE, requires_grad=True).to(device)
-b_left = torch.tensor(b_left, dtype=START_DTYPE, requires_grad=True).to(device)
-b_upper = torch.tensor(b_upper, dtype=START_DTYPE, requires_grad=True).to(device)
-b_lower = torch.tensor(b_lower, dtype=START_DTYPE, requires_grad=True).to(device)
+res = torch.tensor(res, dtype=DTYPE, requires_grad=True).to(device)
+b_left = torch.tensor(b_left, dtype=DTYPE, requires_grad=True).to(device)
+b_right = torch.tensor(b_right, dtype=DTYPE, requires_grad=True).to(device)
+b_upper = torch.tensor(b_upper, dtype=DTYPE, requires_grad=True).to(device)
+b_lower = torch.tensor(b_lower, dtype=DTYPE, requires_grad=True).to(device)
 
 x_res, t_res = res[...,0:1], res[...,1:2]
 x_left, t_left = b_left[...,0:1], b_left[...,1:2]
+x_right, t_right = b_right[...,0:1], b_right[...,1:2]
 x_upper, t_upper = b_upper[...,0:1], b_upper[...,1:2]
 x_lower, t_lower = b_lower[...,0:1], b_lower[...,1:2]
+
+x_test, t_test = res_test[...,0:1], res_test[...,1:2]
 
 # =======================
 # MODEL
@@ -79,183 +75,173 @@ def init_weights(m):
         m.bias.data.zero_()
 
 if args.model == 'KAN':
-    model = get_model(args).Model(
-        width=[2,5,5,1],
-        grid=5, k=3,
-        grid_eps=1.0,
-        noise_scale_base=0.25,
-        device=device
-    )
+    model = get_model(args).Model(width=[2,5,5,1], grid=5, k=3,
+                                  grid_eps=1.0, noise_scale_base=0.25,
+                                  device=device).to(DTYPE)
 elif args.model == 'QRes':
-    model = get_model(args).Model(
-        in_dim=2, hidden_dim=256,
-        out_dim=1, num_layer=4
-    )
+    model = get_model(args).Model(in_dim=2, hidden_dim=256,
+                                  out_dim=1, num_layer=4)
 else:
-    model = get_model(args).Model(
-        in_dim=2, hidden_dim=512,
-        out_dim=1, num_layer=4
-    )
+    model = get_model(args).Model(in_dim=2, hidden_dim=512,
+                                  out_dim=1, num_layer=4)
 
 model.apply(init_weights)
-model = model.to(START_DTYPE).to(device)
+model = model.to(DTYPE).to(device)
 
 # =======================
-# OPTIMIZERS
+# OPTIMIZER
 # =======================
-adam = Adam(model.parameters(), lr=1e-4)
-
-def make_lbfgs():
-    return LBFGS(
-        model.parameters(),
-        line_search_fn='strong_wolfe',
-        tolerance_grad=1e-8,
-        tolerance_change=1e-10
-    )
-
-optimizer = adam
+optimizer = Adam(model.parameters(), lr=1e-4)
 
 # =======================
-# LOGGING
+# LOGGING SETUP
 # =======================
 os.makedirs('./results', exist_ok=True)
 
-loss_hist = []
-loss_res_hist = []
-loss_bc_hist = []
-loss_ic_hist = []
-grad_hist = []
-time_hist = []
-precision_hist = []
+loss_log = './results/adam32_loss_log.txt'
+grad_log = './results/adam32_grad_log.txt'
+flops_log = './results/adam32_flops_log.txt'
+
+with open(loss_log,'w') as f:
+    f.write('epoch,loss_res,loss_bc,loss_ic,total_loss,precision\n')
+with open(grad_log,'w') as f:
+    f.write('epoch,grad_norm,grad_mean,grad_std,precision\n')
+with open(flops_log,'w') as f:
+    f.write('epoch,fwd_flops,bwd_flops,total_flops,fwd_time,bwd_time,total_time,flops_per_sec,precision\n')
 
 # =======================
-# TRAINING
+# FLOPs ESTIMATION
 # =======================
+def estimate_flops(model, batch):
+    flops = 0
+    for m in model.modules():
+        if isinstance(m, nn.Linear):
+            flops += 2*m.in_features*m.out_features*batch
+    return flops
+
+batch_size = x_res.shape[0]
+fwd_flops = estimate_flops(model, batch_size)
+bwd_flops = 2*fwd_flops
+total_flops = fwd_flops + bwd_flops
+
+# =======================
+# TRAINING LOOP
+# =======================
+loss_track = []
+grad_stats = []
+
 for epoch in tqdm(range(TOTAL_EPOCHS), ncols=100):
+    timing = [0.0, 0.0]
 
-    timing_fwd = [0.0]
-    timing_bwd = [0.0]
-    grad_norm_box = [0.0]
+    optimizer.zero_grad()
+    t0 = time.time()
 
-    # containers for logging (LBFGS-safe)
-    loss_res_box = [0.0]
-    loss_bc_box  = [0.0]
-    loss_ic_box  = [0.0]
+    # Forward
+    pred_res = model(x_res, t_res)
+    pred_left = model(x_left, t_left)
+    pred_upper = model(x_upper, t_upper)
+    pred_lower = model(x_lower, t_lower)
 
-    def closure():
-        optimizer.zero_grad()
+    u_x = torch.autograd.grad(pred_res, x_res,
+                              torch.ones_like(pred_res),
+                              retain_graph=True, create_graph=True)[0]
+    u_t = torch.autograd.grad(pred_res, t_res,
+                              torch.ones_like(pred_res),
+                              retain_graph=True, create_graph=True)[0]
 
-        t0 = time.time()
+    loss_res = torch.mean((u_t + BETA*u_x)**2)
+    loss_bc = torch.mean((pred_upper - pred_lower)**2)
+    loss_ic = torch.mean((pred_left[:,0] - torch.sin(x_left[:,0]))**2)
+    loss = loss_res + loss_bc + loss_ic
 
-        pred_res = model(x_res, t_res)
-        pred_left = model(x_left, t_left)
-        pred_upper = model(x_upper, t_upper)
-        pred_lower = model(x_lower, t_lower)
+    timing[0] = time.time() - t0
 
-        u_x = torch.autograd.grad(
-            pred_res, x_res,
-            torch.ones_like(pred_res),
-            retain_graph=True, create_graph=True
-        )[0]
+    # Backward
+    t1 = time.time()
+    loss.backward()
+    optimizer.step()
+    timing[1] = time.time() - t1
 
-        u_t = torch.autograd.grad(
-            pred_res, t_res,
-            torch.ones_like(pred_res),
-            retain_graph=True, create_graph=True
-        )[0]
+    # Grad stats
+    grad_norms, grad_means, grad_stds = [], [], []
+    for p in model.parameters():
+        if p.grad is not None:
+            grad_norms.append(p.grad.norm().item())
+            grad_means.append(p.grad.mean().item())
+            grad_stds.append(p.grad.std().item())
 
-        loss_res = torch.mean((u_t + BETA * u_x)**2)
-        loss_bc  = torch.mean((pred_upper - pred_lower)**2)
-        loss_ic  = torch.mean((pred_left[:,0] - torch.sin(x_left[:,0]))**2)
+    grad_norm = np.sqrt(np.sum(np.array(grad_norms)**2))
+    grad_mean = np.mean(np.array(grad_means))
+    grad_std = np.mean(np.array(grad_stds))
+    grad_stats.append({'norm': grad_norm, 'mean': grad_mean, 'std': grad_std})
 
-        loss = loss_res + loss_bc + loss_ic
+    # Log in real-time
+    precision = 'fp32'
+    total_time = sum(timing)
+    flops_sec = total_flops / total_time if total_time>0 else 0.0
 
-        loss_res_box[0] = loss_res.item()
-        loss_bc_box[0]  = loss_bc.item()
-        loss_ic_box[0]  = loss_ic.item()
+    with open(loss_log,'a') as f:
+        f.write(f"{epoch},{loss_res.item():.8e},{loss_bc.item():.8e},{loss_ic.item():.8e},{loss.item():.8e},{precision}\n")
+        f.flush(); os.fsync(f.fileno())
 
-        timing_fwd[0] = time.time() - t0
+    with open(grad_log,'a') as f:
+        f.write(f"{epoch},{grad_norm:.8e},{grad_mean:.8e},{grad_std:.8e},{precision}\n")
+        f.flush(); os.fsync(f.fileno())
 
-        t1 = time.time()
-        loss.backward()
-        timing_bwd[0] = time.time() - t1
+    with open(flops_log,'a') as f:
+        f.write(f"{epoch},{fwd_flops:.2e},{bwd_flops:.2e},{total_flops:.2e},{timing[0]:.6f},{timing[1]:.6f},{total_time:.6f},{flops_sec:.2e},{precision}\n")
+        f.flush(); os.fsync(f.fileno())
 
-        grad_sq = 0.0
-        for p in model.parameters():
-            if p.grad is not None:
-                grad_sq += p.grad.norm().item()**2
-        grad_norm_box[0] = grad_sq**0.5
-
-        return loss   # 🔴 LBFGS REQUIRES SCALAR ONLY
-
-    if isinstance(optimizer, LBFGS):
-        loss = optimizer.step(closure)
-    else:
-        loss = closure()
-        optimizer.step()
-
-    # =======================
-    # SWITCH
-    # =======================
-    if epoch == SWITCH_EPOCH:
-        print(f"\n🔁 SWITCH Adam FP32 → LBFGS FP64 at epoch {epoch}\n")
-
-        model = model.to(SWITCH_DTYPE)
-        x_res = x_res.to(SWITCH_DTYPE)
-        t_res = t_res.to(SWITCH_DTYPE)
-        x_left = x_left.to(SWITCH_DTYPE)
-        t_left = t_left.to(SWITCH_DTYPE)
-        x_upper = x_upper.to(SWITCH_DTYPE)
-        t_upper = t_upper.to(SWITCH_DTYPE)
-        x_lower = x_lower.to(SWITCH_DTYPE)
-        t_lower = t_lower.to(SWITCH_DTYPE)
-
-        optimizer = make_lbfgs()
-
-    precision = 'fp32' if model.parameters().__next__().dtype == torch.float32 else 'fp64'
-
-    loss_hist.append(loss.item())
-    loss_res_hist.append(loss_res_box[0])
-    loss_bc_hist.append(loss_bc_box[0])
-    loss_ic_hist.append(loss_ic_box[0])
-    grad_hist.append(grad_norm_box[0])
-    time_hist.append(timing_fwd[0] + timing_bwd[0])
-    precision_hist.append(precision)
+    loss_track.append([loss_res.item(), loss_bc.item(), loss_ic.item(), loss.item()])
 
 # =======================
 # SAVE MODEL
 # =======================
-torch.save(model.state_dict(), './results/convect_adam32_lbfgs64.pt')
+torch.save(model.state_dict(), './results/1dconvection_adam32.pt')
 
 # =======================
-# PLOTS
+# PREDICTION & GRAPHS
 # =======================
-epochs = np.arange(len(loss_hist))
+with torch.no_grad():
+    pred = model(x_test, t_test)[:,0:1].cpu().numpy().reshape(101,101)
 
-plt.figure(figsize=(6,4))
-plt.semilogy(epochs, loss_hist)
-plt.axvline(SWITCH_EPOCH, color='red', linestyle='--', label='Switch')
-plt.legend()
-plt.xlabel('Epoch')
-plt.ylabel('Total Loss')
-plt.tight_layout()
-plt.savefig('./results/loss_switch.pdf')
-plt.close()
+def u_exact(x,t):
+    return np.sin(x - BETA*t)
 
-plt.figure(figsize=(6,4))
-plt.plot(epochs, grad_hist)
-plt.axvline(SWITCH_EPOCH, color='red', linestyle='--')
-plt.xlabel('Epoch')
-plt.ylabel('Gradient Norm')
-plt.tight_layout()
-plt.savefig('./results/grad_switch.pdf')
-plt.close()
+res_test_data, _, _, _, _ = get_data([0,2*np.pi],[0,1],101,101)
+u = u_exact(res_test_data[:,0], res_test_data[:,1]).reshape(101,101)
 
-plt.figure(figsize=(6,4))
-plt.plot(epochs, time_hist)
-plt.axvline(SWITCH_EPOCH, color='red', linestyle='--')
-plt.xlabel('Epoch')
-plt.ylabel('Time / Epoch (s)')
-plt.tight_layout()
-plt.savefig('./results/time_switch.pdf')
-plt.close()
+# Errors
+rl1 = np.sum(np.abs(u - pred)) / np.sum(np.abs(u))
+rl2 = np.sqrt(np.sum((u - pred)**2) / np.sum(u**2))
+print(f"relative L1 error: {rl1:.6f}, relative L2 error: {rl2:.6f}")
+
+# Predicted u(x,t)
+plt.figure(figsize=(4,3))
+plt.imshow(pred, extent=[0,2*np.pi,1,0], aspect='auto')
+plt.xlabel('x'); plt.ylabel('t'); plt.title('Predicted u(x,t)'); plt.colorbar(); plt.tight_layout()
+plt.savefig('./results/adam32_pred.pdf'); plt.close()
+
+# Exact
+plt.figure(figsize=(4,3))
+plt.imshow(u, extent=[0,2*np.pi,1,0], aspect='auto')
+plt.xlabel('x'); plt.ylabel('t'); plt.title('Exact u(x,t)'); plt.colorbar(); plt.tight_layout()
+plt.savefig('./results/adam32_exact.pdf'); plt.close()
+
+# Absolute Error
+plt.figure(figsize=(4,3))
+plt.imshow(pred-u, extent=[0,2*np.pi,1,0], aspect='auto', cmap='coolwarm', vmin=-1, vmax=1)
+plt.xlabel('x'); plt.ylabel('t'); plt.title('Absolute Error'); plt.colorbar(); plt.tight_layout()
+plt.savefig('./results/adam32_error.pdf'); plt.close()
+
+# Gradient plots
+grad_norms_history = [s['norm'] for s in grad_stats]
+grad_means_history = [s['mean'] for s in grad_stats]
+grad_stds_history = [s['std'] for s in grad_stats]
+
+plt.figure(figsize=(10,6))
+plt.plot(grad_norms_history); plt.xlabel('Epoch'); plt.ylabel('Gradient Norm'); plt.title('Gradient Norms'); plt.grid(); plt.savefig('./results/adam32_grad_norms.pdf'); plt.close()
+plt.figure(figsize=(10,6))
+plt.plot(grad_means_history); plt.xlabel('Epoch'); plt.ylabel('Gradient Mean'); plt.title('Gradient Means'); plt.grid(); plt.savefig('./results/adam32_grad_means.pdf'); plt.close()
+plt.figure(figsize=(10,6))
+plt.plot(grad_stds_history); plt.xlabel('Epoch'); plt.ylabel('Gradient Std'); plt.title('Gradient Stds'); plt.grid(); plt.savefig('./results/adam32_grad_stds.pdf'); plt.close()
