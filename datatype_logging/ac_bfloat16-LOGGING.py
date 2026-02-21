@@ -23,7 +23,7 @@ num_step=5
 torch.backends.cuda.matmul.allow_tf32 = True
 
 
-for iter in tqdm(range(1)):
+for iter in range(1):
 
     np.random.seed(seed)
     random.seed(seed)
@@ -262,7 +262,7 @@ for iter in tqdm(range(1)):
     with torch.no_grad():
         model.eval()
         pred = model(x_test, t_test)[:, 0:1]
-        pred = pred.cpu().detach().numpy()
+        pred = pred.float().cpu().numpy()
 
     pred = pred.reshape(201, 512)
 

@@ -1,22 +1,26 @@
 import time
-import os
 import torch
 import torch.nn as nn
 import matplotlib.pyplot as plt
 import random
-from torch.optim import LBFGS
+from torch.optim import LBFGS,Adam
 from tqdm import tqdm
+import os
 import argparse
 from util import *
 from model_dict import get_model
 
-seed = 1
+#torch.set_float64_matmul_precision('high')
+#torch.backends.cuda.matmul.allow_tf32 = False
+
+seed = 0
 np.random.seed(seed)
 random.seed(seed)
 torch.manual_seed(seed)
 torch.cuda.manual_seed(seed)
 step_size = 1e-4
 num_step=5
+beta=50
 
 parser = argparse.ArgumentParser('Training Point Optimization')
 parser.add_argument('--model', type=str, default='PINN')
@@ -24,15 +28,18 @@ parser.add_argument('--device', type=str, default='cuda:0')
 args = parser.parse_args()
 device = args.device
 
-res, b_left, b_right, b_upper, b_lower = get_data([0, 2 * np.pi], [0, 1], 101, 101)
-res_test, _, _, _, _ = get_data([0, 2 * np.pi], [0, 1], 101, 101)
+res, b_left, b_right, b_upper, b_lower = get_data([0, 2 * np.pi], [0, 1], 401, 401)
+res_test, b_left_test, _, _, _ = get_data([0, 2 * np.pi], [0, 1], 101, 101)
 
 if args.model == 'PINNsFormer' or args.model == 'PINNMamba':
-    res = make_time_sequence(res, num_step=10, step=step_size)
+    res = make_time_sequence(res, num_step=num_step, step=step_size)
     b_left = make_time_sequence(b_left, num_step=num_step, step=step_size)
     b_right = make_time_sequence(b_right, num_step=num_step, step=step_size)
     b_upper = make_time_sequence(b_upper, num_step=num_step, step=step_size)
     b_lower = make_time_sequence(b_lower, num_step=num_step, step=step_size)
+    
+if args.model == 'PINNsFormer' or args.model == 'PINNMamba':
+    res_test = make_time_sequence(res_test, num_step=num_step, step=step_size)
 
 res = torch.tensor(res, dtype=torch.bfloat16, requires_grad=True).to(device)
 b_left = torch.tensor(b_left, dtype=torch.bfloat16, requires_grad=True).to(device)
@@ -46,15 +53,16 @@ x_right, t_right = b_right[:, ..., 0:1], b_right[:, ..., 1:2]
 x_upper, t_upper = b_upper[:, ..., 0:1], b_upper[:, ..., 1:2]
 x_lower, t_lower = b_lower[:, ..., 0:1], b_lower[:, ..., 1:2]
 
-
+print(t_res)
 def init_weights(m):
     if isinstance(m, nn.Linear):
+        #if(m.bias):
         torch.nn.init.xavier_uniform(m.weight)
         m.bias.data.fill_(0.00)
 
 
 if args.model == 'KAN':
-    model = get_model(args).Model(width=[2, 5, 1], grid=5, k=3, grid_eps=1.0, \
+    model = get_model(args).Model(width=[2, 5, 5, 1], grid=5, k=3, grid_eps=1.0, \
                                   noise_scale_base=0.25, device=device).to(torch.bfloat16).to(device)
 elif args.model == 'QRes':
     model = get_model(args).Model(in_dim=2, hidden_dim=256, out_dim=1, num_layer=4).to(torch.bfloat16).to(device)
@@ -63,26 +71,31 @@ elif args.model == 'PINNsFormer' or args.model == 'PINNsFormer_Enc_Only':
     model = get_model(args).Model(in_dim=2, hidden_dim=32, out_dim=1, num_layer=1).to(torch.bfloat16).to(device)
     model.apply(init_weights)
 else:
-    model = get_model(args).Model(in_dim=2, hidden_dim=1024, out_dim=1, num_layer=6).to(torch.bfloat16).to(device)
+    model = get_model(args).Model(in_dim=2, hidden_dim=512, out_dim=1, num_layer=4).to(torch.bfloat16).to(device)
     model.apply(init_weights)
 
-optim = LBFGS(model.parameters(), line_search_fn='strong_wolfe', tolerance_grad = 1e-8, tolerance_change= 1e-10)
 
+
+#optim = Adam(model.parameters(),lr=1e-6)
+optim = LBFGS(model.parameters(), line_search_fn='strong_wolfe', tolerance_grad = 1e-8, tolerance_change= 1e-10)
 print(model)
 print(get_n_params(model))
+
 loss_track = []
 
-# Create results directory if it doesn't exist
+gradient_stats = []
+
+print(model.named_parameters())
+
+# Set up loss log file
 if not os.path.exists('./results/'):
     os.makedirs('./results/')
-
-# Open log file for writing losses
-log_file_path = f'./results/1dreaction_{args.model}_loss_log.txt'
-with open(log_file_path, 'w') as log_file:
-    log_file.write('epoch,loss_res,loss_bc,loss_ic,total_loss\n')
+loss_log_file = f'./results/1dconvection_{args.model}_{num_step}_{step_size}_{beta}_loss_log.txt'
+with open(loss_log_file, 'w') as f:
+    f.write('epoch,loss_res,loss_bc,loss_ic,total_loss\n')
 
 # Open log file for writing FLOPs/FLOPS
-flops_log_file_path = f'./results/1dreaction_{args.model}_flops_log.txt'
+flops_log_file_path = f'./results/1dconvection_{args.model}_{num_step}_{step_size}_{beta}_flops_log.txt'
 with open(flops_log_file_path, 'w') as flops_log_file:
     flops_log_file.write('epoch,forward_flops,backward_flops,total_flops,forward_time,backward_time,total_time,flops_per_sec\n')
 
@@ -121,7 +134,7 @@ backward_flops_per_pass = forward_flops_per_pass * 2
 
 flops_track = []
 
-for i in tqdm(range(2000)):
+for i in tqdm(range(50000)): 
     # Use a list to store timing info (mutable, can be modified in closure)
     timing_info = [0.0, 0.0]  # [forward_time, backward_time]
     
@@ -143,17 +156,18 @@ for i in tqdm(range(2000)):
         u_t = torch.autograd.grad(pred_res, t_res, grad_outputs=torch.ones_like(pred_res), retain_graph=True,
                                   create_graph=True)[0]
 
-        loss_res = torch.mean((u_t - 5 * pred_res * (1 - pred_res)) ** 2)
+        loss_res = torch.mean((u_t + beta * u_x) ** 2)
         loss_bc = torch.mean((pred_upper - pred_lower) ** 2)
-        loss_ic = torch.mean(
-            (pred_left[:, 0] - torch.exp(- (x_left[:, 0] - torch.pi) ** 2 / (2 * (torch.pi / 4) ** 2))) ** 2)
+        loss_ic = torch.mean((pred_left[:,0] - torch.sin(x_left[:,0])) ** 2)
 
         forward_end_time = time.time()
         timing_info[0] = forward_end_time - forward_start_time
         
         loss_track.append([loss_res.item(), loss_bc.item(), loss_ic.item()])
-
+        #print('Loss Res: {:4f}, Loss_BC: {:4f}, Loss_IC: {:4f}'.format(loss_track[-1][0], loss_track[-1][1], loss_track[-1][2]))
         loss = loss_res + loss_bc + loss_ic
+        #loss = 1000*loss
+        #loss = loss_ic
         optim.zero_grad()
         
         # Measure backward pass time
@@ -163,6 +177,7 @@ for i in tqdm(range(2000)):
         timing_info[1] = backward_end_time - backward_start_time
         
         return loss
+
 
     optim.step(closure)
     
@@ -195,115 +210,211 @@ for i in tqdm(range(2000)):
         flops_per_sec = 0.0
     
     flops_track.append([total_forward_flops, total_backward_flops, total_flops, forward_time_measured, backward_time_measured, total_time, flops_per_sec])
-    
-    # Log losses to file after each epoch
+
+    # Log loss to file
     if len(loss_track) > 0:
-        loss_res_val = loss_track[-1][0]
-        loss_bc_val = loss_track[-1][1]
-        loss_ic_val = loss_track[-1][2]
+        loss_res_val, loss_bc_val, loss_ic_val = loss_track[-1]
         total_loss_val = loss_res_val + loss_bc_val + loss_ic_val
-        
-        with open(log_file_path, 'a') as log_file:
-            log_file.write(f'{i+1},{loss_res_val:.8e},{loss_bc_val:.8e},{loss_ic_val:.8e},{total_loss_val:.8e}\n')
+        with open(loss_log_file, 'a') as f:
+            f.write(f'{i},{loss_res_val:.10e},{loss_bc_val:.10e},{loss_ic_val:.10e},{total_loss_val:.10e}\n')
     
     # Log FLOPs/FLOPS to file after each epoch
     with open(flops_log_file_path, 'a') as flops_log_file:
         flops_log_file.write(f'{i+1},{total_forward_flops:.2e},{total_backward_flops:.2e},{total_flops:.2e},'
                             f'{forward_time_measured:.6f},{backward_time_measured:.6f},{total_time:.6f},{flops_per_sec:.2e}\n')
 
+    grad_norms = []
+    grad_means = []
+    grad_stds = []
+
+
+    if i>50:
+            for name, param in model.named_parameters():
+                if param.grad is not None:
+                    grad_norm = torch.norm(param.grad).item()  
+                    grad_mean = param.grad.mean().item()       
+                    grad_std = param.grad.std().item()      
+                    grad_norms.append(grad_norm)
+                    grad_means.append(grad_mean)
+                    grad_stds.append(grad_std)
+
+           
+            gradient_stats.append({
+                'step': i,
+                'grad_norms': grad_norms,
+                'grad_means': grad_means,
+                'grad_stds': grad_stds
+            })
+
+
+
 print('Loss Res: {:4f}, Loss_BC: {:4f}, Loss_IC: {:4f}'.format(loss_track[-1][0], loss_track[-1][1], loss_track[-1][2]))
 print('Train Loss: {:4f}'.format(np.sum(loss_track[-1])))
 
-torch.save(model.state_dict(), f'./results/1dreaction_{args.model}_point.pt')
+if not os.path.exists('./results/'):
+    os.makedirs('./results/')
+
+torch.save(model.state_dict(), f'./results/1dconvection_{args.model}_{num_step}_{step_size}.pt')
 
 # Visualize
-if args.model == 'PINNsFormer' or args.model == 'PINNMamba':
-    res_test = make_time_sequence(res_test, num_step=5, step=1e-4)
+
 
 res_test = torch.tensor(res_test, dtype=torch.bfloat16, requires_grad=True).to(device)
 x_test, t_test = res_test[:, ..., 0:1], res_test[:, ..., 1:2]
+x_left_test, t_left_test = b_left_test[:, ..., 0:1], b_left_test[:, ..., 1:2]
 
-with torch.no_grad():
-    pred = model(x_test, t_test)[:, 0:1]
-    pred = pred.cpu().detach().numpy()
 
+#print(t_test)
+#with torch.no_grad():
+pred = model(x_test, t_test)[:, 0:1]
+u_x = torch.autograd.grad(pred, x_test, grad_outputs=torch.ones_like(pred), retain_graph=True,
+                                  create_graph=True)[0]
+u_t = torch.autograd.grad(pred, t_test, grad_outputs=torch.ones_like(pred), retain_graph=True,
+                                  create_graph=True)[0]
+#loss_res = (u_t + 50 * u_x) ** 2
+
+
+    #print(pred.shape)
+    #pred = model(x_test, t_test)[:, 0:1]
+#loss_res = loss_res.cpu().detach().numpy()
+#loss_res = loss_res.reshape(101, 101)
+
+#print(loss_res)
+
+pred = pred.float().cpu().numpy()
+
+#print(pred.shape) 
 pred = pred.reshape(101, 101)
 
 
-def h(x):
-    return np.exp(- (x - np.pi) ** 2 / (2 * (np.pi / 4) ** 2))
-
-
-def u_ana(x, t):
-    return h(x) * np.exp(5 * t) / (h(x) * np.exp(5 * t) + 1 - h(x))
+def u_res(x, t):
+    #print(x.shape)
+    #print(t.shape)
+    return np.sin(x - beta * t)
 
 
 res_test, _, _, _, _ = get_data([0, 2 * np.pi], [0, 1], 101, 101)
-u = u_ana(res_test[:, 0], res_test[:, 1]).reshape(101, 101)
+u = u_res(res_test[:, 0], res_test[:, 1]).reshape(101, 101)
 
 rl1 = np.sum(np.abs(u - pred)) / np.sum(np.abs(u))
 rl2 = np.sqrt(np.sum((u - pred) ** 2) / np.sum(u ** 2))
 
+print(beta)
 print('relative L1 error: {:4f}'.format(rl1))
 print('relative L2 error: {:4f}'.format(rl2))
 
 plt.figure(figsize=(4, 3))
-plt.imshow(pred, extent=[0,1,1,0], aspect='auto')
+plt.imshow(pred,extent=[0,np.pi*2,1,0], aspect='auto')
 plt.xlabel('x')
 plt.ylabel('t')
 plt.title('Predicted u(x,t)')
 plt.colorbar()
 plt.tight_layout()
 #plt.axis('off')
-plt.savefig(f'./results/1d_reaction_{args.model}_{num_step}_{step_size}_pred.pdf', bbox_inches='tight')
+plt.savefig(f'./results/convection_{args.model}_{num_step}_{step_size}_{beta}_pred.pdf', bbox_inches='tight')
 
 plt.figure(figsize=(4, 3))
-plt.imshow(u, extent=[0,1,1,0], aspect='auto')
+plt.imshow(u,extent=[0,np.pi*2,1,0], aspect='auto')
 plt.xlabel('x')
 plt.ylabel('t')
 plt.title('Exact u(x,t)')
 plt.colorbar()
 plt.tight_layout()
 #plt.axis('off')
-plt.savefig('./results/1d_reaction_exact.pdf', bbox_inches='tight')
+plt.savefig('./results/convection_exact_{beta}.pdf', bbox_inches='tight')
 
 plt.figure(figsize=(4, 3))
-plt.imshow(pred - u, extent=[0,1,1,0], aspect='auto', cmap='coolwarm', vmin=-0.15, vmax=0.15)
+plt.imshow(pred - u, extent=[0,np.pi*2,1,0], aspect='auto', cmap='coolwarm', vmin=-1, vmax=1)
 plt.xlabel('x')
 plt.ylabel('t')
 plt.title('Absolute Error')
 plt.colorbar()
 plt.tight_layout()
 #plt.axis('off')
-plt.savefig(f'./results/1d_reaction_{args.model}_{num_step}_{step_size}_error.pdf', bbox_inches='tight')
+plt.savefig(f'./results/convection_{args.model}_{num_step}_{step_size}_{beta}_error.pdf', bbox_inches='tight')
 
-# Plot loss curves from log file
+grad_norms_history = [stats['grad_norms'] for stats in gradient_stats]
+grad_means_history = [stats['grad_means'] for stats in gradient_stats]
+grad_stds_history = [stats['grad_stds'] for stats in gradient_stats]
+
+
+plt.figure(figsize=(10, 6))
+for i in range(len(grad_norms_history[0])):
+    plt.plot([stats[i] for stats in grad_norms_history], label=f'Layer {i+1}')
+plt.xlabel('Training Step')
+plt.ylabel('Gradient Norm')
+plt.title('Gradient Norms During Training')
+plt.legend()
+plt.grid()
+plt.savefig(f'./results/1d_convection_{args.model}_{beta}_fp64_gradient_norms.pdf')  
+plt.close()  
+
+
+plt.figure(figsize=(10, 6))
+for i in range(len(grad_means_history[0])):
+    plt.plot([stats[i] for stats in grad_means_history], label=f'Layer {i+1}')
+plt.xlabel('Training Step')
+plt.ylabel('Gradient Mean')
+plt.title('Gradient Means During Training')
+plt.legend()
+plt.grid()
+plt.savefig(f'./results/1d_convection_{args.model}_{beta}_fp64_gradient_means.pdf')  
+plt.close()  
+
+
+plt.figure(figsize=(10, 6))
+for i in range(len(grad_stds_history[0])):
+    plt.plot([stats[i] for stats in grad_stds_history], label=f'Layer {i+1}')
+plt.xlabel('Training Step')
+plt.ylabel('Gradient Std')
+plt.title('Gradient Stds During Training')
+plt.legend()
+plt.grid()
+plt.savefig(f'./results/1d_convection_{args.model}_{beta}_fp64_gradient_stds.pdf')  
+plt.close()  
+
+# Read loss log file and create loss vs epoch plot
 try:
-    # Load the loss data
-    loss_data = np.loadtxt(log_file_path, delimiter=',', skiprows=1)
+    loss_data = np.loadtxt(loss_log_file, delimiter=',', skiprows=1)
     epochs = loss_data[:, 0]
     loss_res = loss_data[:, 1]
     loss_bc = loss_data[:, 2]
     loss_ic = loss_data[:, 3]
     total_loss = loss_data[:, 4]
     
-    # Create loss vs epoch plot
-    plt.figure(figsize=(10, 6))
-    plt.semilogy(epochs, total_loss, 'b-', label='Total Loss', linewidth=2)
-    plt.semilogy(epochs, loss_res, 'r--', label='Residual Loss', linewidth=1.5, alpha=0.7)
-    plt.semilogy(epochs, loss_bc, 'g--', label='Boundary Condition Loss', linewidth=1.5, alpha=0.7)
-    plt.semilogy(epochs, loss_ic, 'm--', label='Initial Condition Loss', linewidth=1.5, alpha=0.7)
-    plt.xlabel('Epoch', fontsize=12)
-    plt.ylabel('Loss (log scale)', fontsize=12)
-    plt.title(f'Training Loss vs Epoch - {args.model}', fontsize=14)
-    plt.legend(fontsize=10)
+    plt.figure(figsize=(12, 8))
+    
+    # Plot individual loss components
+    plt.subplot(2, 1, 1)
+    plt.plot(epochs, loss_res, label='Loss Res', alpha=0.7)
+    plt.plot(epochs, loss_bc, label='Loss BC', alpha=0.7)
+    plt.plot(epochs, loss_ic, label='Loss IC', alpha=0.7)
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.title('Individual Loss Components')
+    plt.legend()
     plt.grid(True, alpha=0.3)
+    plt.yscale('log')  # Use log scale for better visualization
+    
+    # Plot total loss
+    plt.subplot(2, 1, 2)
+    plt.plot(epochs, total_loss, label='Total Loss', color='red', linewidth=2)
+    plt.xlabel('Epoch')
+    plt.ylabel('Total Loss')
+    plt.title('Total Loss vs Epoch')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.yscale('log')  # Use log scale for better visualization
+    
     plt.tight_layout()
-    plt.savefig(f'./results/1d_reaction_{args.model}_loss_curve.pdf', bbox_inches='tight')
-    print(f'Loss curve saved to: ./results/1d_reaction_{args.model}_loss_curve.pdf')
-    print(f'Loss log file location: {os.path.abspath(log_file_path)}')
+    plt.savefig(f'./results/1d_convection_{args.model}_{beta}_fp64_loss_vs_epoch.pdf', bbox_inches='tight')
+    plt.close()
+    
+    print(f'\nLoss log file saved at: {loss_log_file}')
+    print(f'Loss plot saved at: ./results/1d_convection_{args.model}_{beta}_fp64_loss_vs_epoch.pdf')
+    
 except Exception as e:
-    print(f'Warning: Could not plot loss curves: {e}')
+    print(f'Warning: Could not read loss log file or create plot: {e}')
 
 # Plot FLOPs/FLOPS curves from log file
 try:
@@ -364,8 +475,9 @@ try:
     plt.grid(True, alpha=0.3)
     
     plt.tight_layout()
-    plt.savefig(f'./results/1d_reaction_{args.model}_flops_curve.pdf', bbox_inches='tight')
-    print(f'FLOPs/FLOPS curve saved to: ./results/1d_reaction_{args.model}_flops_curve.pdf')
+    plt.savefig(f'./results/1d_convection_{args.model}_{num_step}_{step_size}_{beta}_flops_curve.pdf', bbox_inches='tight')
+    plt.close()
+    print(f'FLOPs/FLOPS curve saved to: ./results/1d_convection_{args.model}_{num_step}_{step_size}_{beta}_flops_curve.pdf')
     print(f'FLOPs log file location: {os.path.abspath(flops_log_file_path)}')
 except Exception as e:
     print(f'Warning: Could not plot FLOPs/FLOPS curves: {e}')
