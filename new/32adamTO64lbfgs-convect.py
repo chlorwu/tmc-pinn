@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 import matplotlib.pyplot as plt
 import random
-from torch.optim import Adam
+from torch.optim import Adam, LBFGS
 from tqdm import tqdm
 import argparse
 import numpy as np
@@ -12,13 +12,15 @@ from util import *
 from model_dict import get_model
 
 # =======================
-# CONFIG
+# CONFIG — two-stage: FP32 Adam -> FP64 L-BFGS
 # =======================
-TOTAL_EPOCHS = 50000
+ADAM_EPOCHS = 20000
+LBFGS_MAX_ITER = 30000
 STEP_SIZE = 1e-4
 NUM_STEP = 5
 BETA = 50
-DTYPE = torch.float32  # Adam32 only
+DTYPE_ADAM = torch.float32
+DTYPE_LBFGS = torch.float64
 
 # =======================
 # SEED
@@ -33,7 +35,7 @@ torch.cuda.manual_seed(seed)
 # ARGS
 # =======================
 parser = argparse.ArgumentParser()
-parser.add_argument('--model', type=str, default='pinn')
+parser.add_argument('--model', type=str, default='PINN')
 parser.add_argument('--device', type=str, default='cuda:0')
 args = parser.parse_args()
 device = args.device
@@ -52,11 +54,11 @@ if args.model in ['PINNsFormer','PINNMamba']:
     b_lower = make_time_sequence(b_lower, NUM_STEP, STEP_SIZE)
     res_test = make_time_sequence(res_test, NUM_STEP, STEP_SIZE)
 
-res = torch.tensor(res, dtype=DTYPE, requires_grad=True).to(device)
-b_left = torch.tensor(b_left, dtype=DTYPE, requires_grad=True).to(device)
-b_right = torch.tensor(b_right, dtype=DTYPE, requires_grad=True).to(device)
-b_upper = torch.tensor(b_upper, dtype=DTYPE, requires_grad=True).to(device)
-b_lower = torch.tensor(b_lower, dtype=DTYPE, requires_grad=True).to(device)
+res = torch.tensor(res, dtype=DTYPE_ADAM, requires_grad=True).to(device)
+b_left = torch.tensor(b_left, dtype=DTYPE_ADAM, requires_grad=True).to(device)
+b_right = torch.tensor(b_right, dtype=DTYPE_ADAM, requires_grad=True).to(device)
+b_upper = torch.tensor(b_upper, dtype=DTYPE_ADAM, requires_grad=True).to(device)
+b_lower = torch.tensor(b_lower, dtype=DTYPE_ADAM, requires_grad=True).to(device)
 
 x_res, t_res = res[...,0:1], res[...,1:2]
 x_left, t_left = b_left[...,0:1], b_left[...,1:2]
@@ -77,7 +79,7 @@ def init_weights(m):
 if args.model == 'KAN':
     model = get_model(args).Model(width=[2,5,5,1], grid=5, k=3,
                                   grid_eps=1.0, noise_scale_base=0.25,
-                                  device=device).to(DTYPE)
+                                  device=device).to(DTYPE_ADAM)
 elif args.model == 'QRes':
     model = get_model(args).Model(in_dim=2, hidden_dim=256,
                                   out_dim=1, num_layer=4)
@@ -86,21 +88,16 @@ else:
                                   out_dim=1, num_layer=4)
 
 model.apply(init_weights)
-model = model.to(DTYPE).to(device)
-
-# =======================
-# OPTIMIZER
-# =======================
-optimizer = Adam(model.parameters(), lr=1e-4)
+model = model.to(DTYPE_ADAM).to(device)
 
 # =======================
 # LOGGING SETUP
 # =======================
 os.makedirs('./results', exist_ok=True)
 
-loss_log = './results/adam32_loss_log.txt'
-grad_log = './results/adam32_grad_log.txt'
-flops_log = './results/adam32_flops_log.txt'
+loss_log = './results/32adamTO64lbfgs_convect_loss_log.txt'
+grad_log = './results/32adamTO64lbfgs_convect_grad_log.txt'
+flops_log = './results/32adamTO64lbfgs_convect_flops_log.txt'
 
 with open(loss_log,'w') as f:
     f.write('epoch,loss_res,loss_bc,loss_ic,total_loss,precision\n')
@@ -125,12 +122,13 @@ bwd_flops = 2*fwd_flops
 total_flops = fwd_flops + bwd_flops
 
 # =======================
-# TRAINING LOOP
+# STAGE 1: FP32 Adam
 # =======================
+optimizer = Adam(model.parameters(), lr=1e-4)
 loss_track = []
 grad_stats = []
 
-for epoch in tqdm(range(TOTAL_EPOCHS), ncols=100):
+for epoch in tqdm(range(ADAM_EPOCHS), desc="Stage 1 Adam (FP32)", ncols=100):
     timing = [0.0, 0.0]
 
     optimizer.zero_grad()
@@ -195,15 +193,94 @@ for epoch in tqdm(range(TOTAL_EPOCHS), ncols=100):
     loss_track.append([loss_res.item(), loss_bc.item(), loss_ic.item(), loss.item()])
 
 # =======================
+# STAGE 2: FP64 L-BFGS
+# =======================
+# Convert model and data to FP64
+model = model.to(DTYPE_LBFGS)
+x_res = x_res.to(DTYPE_LBFGS)
+t_res = t_res.to(DTYPE_LBFGS)
+x_left = x_left.to(DTYPE_LBFGS)
+t_left = t_left.to(DTYPE_LBFGS)
+x_right = x_right.to(DTYPE_LBFGS)
+t_right = t_right.to(DTYPE_LBFGS)
+x_upper = x_upper.to(DTYPE_LBFGS)
+t_upper = t_upper.to(DTYPE_LBFGS)
+x_lower = x_lower.to(DTYPE_LBFGS)
+t_lower = t_lower.to(DTYPE_LBFGS)
+
+lbfgs_optimizer = LBFGS(model.parameters(), line_search_fn='strong_wolfe',
+                        tolerance_grad=1e-8, tolerance_change=1e-10)
+
+# Containers for closure to write loss values (L-BFGS may call closure multiple times; we keep last)
+loss_capture = [None, None, None, None]  # loss_res, loss_bc, loss_ic, total
+
+def loss_closure():
+    lbfgs_optimizer.zero_grad()
+    pred_res = model(x_res, t_res)
+    pred_left = model(x_left, t_left)
+    pred_upper = model(x_upper, t_upper)
+    pred_lower = model(x_lower, t_lower)
+    u_x = torch.autograd.grad(pred_res, x_res,
+                              torch.ones_like(pred_res),
+                              retain_graph=True, create_graph=True)[0]
+    u_t = torch.autograd.grad(pred_res, t_res,
+                              torch.ones_like(pred_res),
+                              retain_graph=True, create_graph=True)[0]
+    loss_res = torch.mean((u_t + BETA*u_x)**2)
+    loss_bc = torch.mean((pred_upper - pred_lower)**2)
+    loss_ic = torch.mean((pred_left[:,0] - torch.sin(x_left[:,0]))**2)
+    loss = loss_res + loss_bc + loss_ic
+    loss.backward()
+    loss_capture[0], loss_capture[1], loss_capture[2], loss_capture[3] = (
+        loss_res.item(), loss_bc.item(), loss_ic.item(), loss.item())
+    return loss
+
+for step in tqdm(range(LBFGS_MAX_ITER), desc="Stage 2 L-BFGS (FP64)", ncols=100):
+    epoch = ADAM_EPOCHS + step
+    t0 = time.time()
+    lbfgs_optimizer.step(loss_closure)
+    total_time = time.time() - t0
+
+    loss_res_v, loss_bc_v, loss_ic_v, loss_v = loss_capture[0], loss_capture[1], loss_capture[2], loss_capture[3]
+
+    # Grad stats from current parameters (closure already ran backward)
+    grad_norms, grad_means, grad_stds = [], [], []
+    for p in model.parameters():
+        if p.grad is not None:
+            grad_norms.append(p.grad.norm().item())
+            grad_means.append(p.grad.mean().item())
+            grad_stds.append(p.grad.std().item())
+    grad_norm = np.sqrt(np.sum(np.array(grad_norms)**2)) if grad_norms else 0.0
+    grad_mean = np.mean(grad_means) if grad_means else 0.0
+    grad_std = np.mean(grad_stds) if grad_stds else 0.0
+    grad_stats.append({'norm': grad_norm, 'mean': grad_mean, 'std': grad_std})
+
+    precision = 'fp64'
+    flops_sec = total_flops / total_time if total_time > 0 else 0.0
+    with open(loss_log,'a') as f:
+        f.write(f"{epoch},{loss_res_v:.8e},{loss_bc_v:.8e},{loss_ic_v:.8e},{loss_v:.8e},{precision}\n")
+        f.flush(); os.fsync(f.fileno())
+    with open(grad_log,'a') as f:
+        f.write(f"{epoch},{grad_norm:.8e},{grad_mean:.8e},{grad_std:.8e},{precision}\n")
+        f.flush(); os.fsync(f.fileno())
+    with open(flops_log,'a') as f:
+        f.write(f"{epoch},{fwd_flops:.2e},{bwd_flops:.2e},{total_flops:.2e},{total_time:.6f},{total_time:.6f},{total_time:.6f},{flops_sec:.2e},{precision}\n")
+        f.flush(); os.fsync(f.fileno())
+    loss_track.append([loss_res_v, loss_bc_v, loss_ic_v, loss_v])
+
+# =======================
 # SAVE MODEL
 # =======================
-torch.save(model.state_dict(), './results/1dconvection_adam32.pt')
+torch.save(model.state_dict(), './results/1dconvection_32adamTO64lbfgs_convect.pt')
 
 # =======================
 # PREDICTION & GRAPHS
 # =======================
+# Model is FP64 after stage 2; use FP64 test inputs
+x_test_f64 = torch.tensor(res_test[..., 0:1], dtype=DTYPE_LBFGS, device=device)
+t_test_f64 = torch.tensor(res_test[..., 1:2], dtype=DTYPE_LBFGS, device=device)
 with torch.no_grad():
-    pred = model(x_test, t_test)[:,0:1].cpu().numpy().reshape(101,101)
+    pred = model(x_test_f64, t_test_f64)[:,0:1].cpu().numpy().reshape(101,101)
 
 def u_exact(x,t):
     return np.sin(x - BETA*t)
@@ -220,19 +297,19 @@ print(f"relative L1 error: {rl1:.6f}, relative L2 error: {rl2:.6f}")
 plt.figure(figsize=(4,3))
 plt.imshow(pred, extent=[0,2*np.pi,1,0], aspect='auto')
 plt.xlabel('x'); plt.ylabel('t'); plt.title('Predicted u(x,t)'); plt.colorbar(); plt.tight_layout()
-plt.savefig('./results/adam32_pred.pdf'); plt.close()
+plt.savefig('./results/32adamTO64lbfgs_convect_pred.pdf'); plt.close()
 
 # Exact
 plt.figure(figsize=(4,3))
 plt.imshow(u, extent=[0,2*np.pi,1,0], aspect='auto')
 plt.xlabel('x'); plt.ylabel('t'); plt.title('Exact u(x,t)'); plt.colorbar(); plt.tight_layout()
-plt.savefig('./results/adam32_exact.pdf'); plt.close()
+plt.savefig('./results/32adamTO64lbfgs_convect_exact.pdf'); plt.close()
 
 # Absolute Error
 plt.figure(figsize=(4,3))
 plt.imshow(pred-u, extent=[0,2*np.pi,1,0], aspect='auto', cmap='coolwarm', vmin=-1, vmax=1)
 plt.xlabel('x'); plt.ylabel('t'); plt.title('Absolute Error'); plt.colorbar(); plt.tight_layout()
-plt.savefig('./results/adam32_error.pdf'); plt.close()
+plt.savefig('./results/32adamTO64lbfgs_convect_error.pdf'); plt.close()
 
 # Gradient plots
 grad_norms_history = [s['norm'] for s in grad_stats]
@@ -240,8 +317,8 @@ grad_means_history = [s['mean'] for s in grad_stats]
 grad_stds_history = [s['std'] for s in grad_stats]
 
 plt.figure(figsize=(10,6))
-plt.plot(grad_norms_history); plt.xlabel('Epoch'); plt.ylabel('Gradient Norm'); plt.title('Gradient Norms'); plt.grid(); plt.savefig('./results/adam32_grad_norms.pdf'); plt.close()
+plt.plot(grad_norms_history); plt.xlabel('Epoch'); plt.ylabel('Gradient Norm'); plt.title('Gradient Norms'); plt.grid(); plt.savefig('./results/32adamTO64lbfgs_convect_grad_norms.pdf'); plt.close()
 plt.figure(figsize=(10,6))
-plt.plot(grad_means_history); plt.xlabel('Epoch'); plt.ylabel('Gradient Mean'); plt.title('Gradient Means'); plt.grid(); plt.savefig('./results/adam32_grad_means.pdf'); plt.close()
+plt.plot(grad_means_history); plt.xlabel('Epoch'); plt.ylabel('Gradient Mean'); plt.title('Gradient Means'); plt.grid(); plt.savefig('./results/32adamTO64lbfgs_convect_grad_means.pdf'); plt.close()
 plt.figure(figsize=(10,6))
-plt.plot(grad_stds_history); plt.xlabel('Epoch'); plt.ylabel('Gradient Std'); plt.title('Gradient Stds'); plt.grid(); plt.savefig('./results/adam32_grad_stds.pdf'); plt.close()
+plt.plot(grad_stds_history); plt.xlabel('Epoch'); plt.ylabel('Gradient Std'); plt.title('Gradient Stds'); plt.grid(); plt.savefig('./results/32adamTO64lbfgs_convect_grad_stds.pdf'); plt.close()
